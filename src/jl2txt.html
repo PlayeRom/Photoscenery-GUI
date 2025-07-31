@@ -1,0 +1,843 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>File Monitor Pro</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github-dark.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/languages/cpp.min.js"></script>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+        }
+
+        body {
+            display: flex;
+            min-height: 100vh;
+            background: linear-gradient(135deg, #1a2a6c, #2c3e50);
+            color: #f0f0f0;
+            padding: 20px;
+        }
+
+        .container {
+            display: flex;
+            width: 100%;
+            max-width: 1600px;
+            margin: 0 auto;
+            gap: 20px;
+        }
+
+        /* Pannello sinistro */
+        .left-panel {
+            width: 35%;
+            display: flex;
+            flex-direction: column;
+            background: rgba(25, 35, 60, 0.8);
+            border-radius: 12px;
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.4);
+            overflow: hidden;
+        }
+
+        .panel-header {
+            padding: 20px;
+            background: rgba(15, 25, 50, 0.9);
+            border-bottom: 1px solid rgba(100, 130, 200, 0.3);
+        }
+
+        .panel-title {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-bottom: 15px;
+        }
+
+        .panel-title h2 {
+            font-size: 22px;
+            font-weight: 600;
+            color: #64b5f6;
+        }
+
+        .panel-title i {
+            font-size: 24px;
+            color: #64b5f6;
+        }
+
+        .controls {
+            display: flex;
+            gap: 15px;
+            flex-wrap: wrap;
+        }
+
+        .btn {
+            padding: 10px 18px;
+            border: none;
+            border-radius: 6px;
+            background: #2196f3;
+            color: white;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .btn:hover {
+            background: #1976d2;
+            transform: translateY(-2px);
+            box-shadow: 0 4px 8px rgba(0, 0, 0, 0.2);
+        }
+
+        .btn i {
+            font-size: 16px;
+        }
+
+        .interval-select {
+            padding: 10px 15px;
+            border-radius: 6px;
+            background: rgba(50, 70, 120, 0.8);
+            border: 1px solid rgba(100, 130, 200, 0.3);
+            color: white;
+            font-size: 14px;
+            flex-grow: 1;
+        }
+
+        .status {
+            margin-top: 15px;
+            padding: 12px;
+            background: rgba(40, 50, 90, 0.6);
+            border-radius: 6px;
+            font-size: 14px;
+            border-left: 4px solid #2196f3;
+        }
+
+        .status i {
+            margin-right: 8px;
+            color: #64b5f6;
+        }
+
+        /* Sezione file evidenziati */
+        .highlighted-section {
+            padding: 15px 20px;
+            background: rgba(30, 45, 90, 0.7);
+            border-bottom: 1px solid rgba(100, 130, 200, 0.3);
+        }
+
+        .section-title {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin-bottom: 15px;
+            color: #ff9800;
+            font-size: 18px;
+        }
+
+        .section-title i {
+            font-size: 20px;
+        }
+
+        .highlighted-files {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+
+        .highlighted-file {
+            background: rgba(50, 70, 120, 0.5);
+            border-radius: 6px;
+            padding: 10px 15px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            transition: all 0.3s;
+        }
+
+        .highlighted-file:hover {
+            background: rgba(60, 85, 150, 0.6);
+            transform: translateX(5px);
+        }
+
+        .file-name {
+            font-size: 14px;
+            font-weight: 500;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            max-width: 70%;
+        }
+
+        .file-actions {
+            display: flex;
+            gap: 10px;
+        }
+
+        .action-btn {
+            width: 30px;
+            height: 30px;
+            border-radius: 50%;
+            border: none;
+            background: rgba(100, 130, 200, 0.4);
+            color: white;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: all 0.3s;
+        }
+
+        .action-btn:hover {
+            background: #2196f3;
+            transform: scale(1.1);
+        }
+
+        /* Lista file principale */
+        .files-section {
+            flex-grow: 1;
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+        }
+
+        .files-header {
+            padding: 15px 20px;
+            background: rgba(20, 35, 70, 0.8);
+            border-bottom: 1px solid rgba(100, 130, 200, 0.3);
+        }
+
+        .file-list {
+            flex-grow: 1;
+            overflow-y: auto;
+            padding: 15px;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+
+        .file-item {
+            background: rgba(40, 60, 100, 0.5);
+            border-radius: 8px;
+            padding: 12px 15px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            transition: all 0.3s;
+        }
+
+        .file-item:hover {
+            background: rgba(50, 80, 140, 0.6);
+        }
+
+        .file-item.active {
+            background: rgba(30, 100, 200, 0.7);
+            border-left: 4px solid #2196f3;
+        }
+
+        .file-info {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .file-icon {
+            width: 40px;
+            height: 40px;
+            border-radius: 8px;
+            background: rgba(33, 150, 243, 0.2);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 18px;
+        }
+
+        .file-details {
+            display: flex;
+            flex-direction: column;
+        }
+
+        .file-main-name {
+            font-weight: 600;
+            font-size: 14px;
+        }
+
+        .file-timestamp {
+            font-size: 12px;
+            color: #aaa;
+            margin-top: 3px;
+        }
+
+        /* Pannello destro */
+        .right-panel {
+            width: 65%;
+            display: flex;
+            flex-direction: column;
+            background: rgba(25, 35, 60, 0.8);
+            border-radius: 12px;
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.4);
+            overflow: hidden;
+        }
+
+        .file-content-header {
+            padding: 20px;
+            background: rgba(15, 25, 50, 0.9);
+            border-bottom: 1px solid rgba(100, 130, 200, 0.3);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .content-title {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            font-size: 22px;
+            color: #64b5f6;
+        }
+
+        .file-content {
+            flex-grow: 1;
+            padding: 20px;
+            overflow: auto;
+            background: #0d1525;
+        }
+
+        .file-content pre {
+            margin: 0;
+            padding: 20px;
+            border-radius: 8px;
+            background: #0d1525 !important;
+            height: 100%;
+            overflow: auto;
+        }
+
+        .no-file {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            height: 100%;
+            color: #aaa;
+            text-align: center;
+            padding: 40px;
+        }
+
+        .no-file i {
+            font-size: 48px;
+            margin-bottom: 20px;
+            color: #3a506b;
+        }
+
+        .no-file h3 {
+            font-size: 24px;
+            margin-bottom: 15px;
+            color: #64b5f6;
+        }
+
+        .notification {
+            position: fixed;
+            bottom: 20px;
+            right: 20px;
+            padding: 15px 25px;
+            background: rgba(40, 60, 100, 0.95);
+            color: white;
+            border-radius: 8px;
+            box-shadow: 0 5px 15px rgba(0, 0, 0, 0.3);
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            transform: translateY(100px);
+            opacity: 0;
+            transition: all 0.4s;
+            z-index: 1000;
+        }
+
+        .notification.show {
+            transform: translateY(0);
+            opacity: 1;
+        }
+
+        /* Responsive */
+        @media (max-width: 1100px) {
+            .container {
+                flex-direction: column;
+            }
+
+            .left-panel, .right-panel {
+                width: 100%;
+            }
+
+            .left-panel {
+                height: 50vh;
+            }
+        }
+
+        /* Scrollbar */
+        ::-webkit-scrollbar {
+            width: 8px;
+        }
+
+        ::-webkit-scrollbar-track {
+            background: rgba(20, 30, 60, 0.5);
+            border-radius: 4px;
+        }
+
+        ::-webkit-scrollbar-thumb {
+            background: rgba(100, 130, 200, 0.5);
+            border-radius: 4px;
+        }
+
+        ::-webkit-scrollbar-thumb:hover {
+            background: rgba(100, 130, 200, 0.8);
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <!-- Pannello sinistro -->
+        <div class="left-panel">
+            <div class="panel-header">
+                <div class="panel-title">
+                    <i class="fas fa-folder-open"></i>
+                    <h2>File Monitor Pro</h2>
+                </div>
+
+                <div class="controls">
+                    <button id="directory-picker" class="btn">
+                        <i class="fas fa-folder"></i> Seleziona Directory
+                    </button>
+
+                    <select id="scan-interval" class="interval-select">
+                        <option value="1000">1 secondo</option>
+                        <option value="2000">2 secondi</option>
+                        <option value="4000">4 secondi</option>
+                        <option value="8000" selected>8 secondi</option>
+                        <option value="16000">16 secondi</option>
+                    </select>
+                </div>
+
+                <div class="status">
+                    <i class="fas fa-info-circle"></i>
+                    <span id="status">Seleziona una directory per iniziare il monitoraggio</span>
+                </div>
+            </div>
+
+            <!-- Sezione file evidenziati -->
+            <div class="highlighted-section">
+                <div class="section-title">
+                    <i class="fas fa-star"></i>
+                    <h3>File in Evidenza</h3>
+                </div>
+
+                <div id="highlighted-files" class="highlighted-files">
+                    <div class="no-highlighted">
+                        <i class="fas fa-star"></i>
+                        <p>Nessun file in evidenza</p>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Lista file principale -->
+            <div class="files-section">
+                <div class="files-header">
+                    <div class="section-title">
+                        <i class="fas fa-file-alt"></i>
+                        <h3>Tutti i File</h3>
+                    </div>
+                </div>
+
+                <div id="file-list" class="file-list">
+                    <div class="no-files">
+                        <i class="fas fa-file"></i>
+                        <p>Nessun file disponibile</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Pannello destro -->
+        <div class="right-panel">
+            <div class="file-content-header">
+                <div class="content-title">
+                    <i class="fas fa-file-code"></i>
+                    <h3>Contenuto File</h3>
+                </div>
+            </div>
+
+            <div id="file-content" class="file-content">
+                <div class="no-file">
+                    <i class="fas fa-file-alt"></i>
+                    <h3>Nessun file selezionato</h3>
+                    <p>Seleziona un file dalla lista per visualizzarne il contenuto</p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div id="notification" class="notification">
+        <i class="fas fa-check-circle"></i>
+        <span>Nome file copiato negli appunti!</span>
+    </div>
+
+    <script>
+        // Elementi DOM
+        const directoryPickerBtn = document.getElementById('directory-picker');
+        const scanIntervalSelect = document.getElementById('scan-interval');
+        const statusDiv = document.getElementById('status');
+        const fileList = document.getElementById('file-list');
+        const highlightedFiles = document.getElementById('highlighted-files');
+        const fileContentDiv = document.getElementById('file-content');
+        const notification = document.getElementById('notification');
+
+        // Variabili globali
+        let directoryHandle;
+        let txtDirectoryHandle;
+        let scanInterval;
+        const monitoredFiles = new Map();
+        const highlightedFilesSet = new Set();
+        let lastScanned = Date.now();
+
+        // Carica file evidenziati da localStorage
+        function loadHighlightedFiles() {
+            const saved = localStorage.getItem('highlightedFiles');
+            if (saved) {
+                const files = JSON.parse(saved);
+                files.forEach(file => highlightedFilesSet.add(file));
+            }
+        }
+
+        // Salva file evidenziati in localStorage
+        function saveHighlightedFiles() {
+            const files = Array.from(highlightedFilesSet);
+            localStorage.setItem('highlightedFiles', JSON.stringify(files));
+        }
+
+        // Mostra notifica
+        function showNotification(message) {
+            notification.querySelector('span').textContent = message;
+            notification.classList.add('show');
+
+            setTimeout(() => {
+                notification.classList.remove('show');
+            }, 3000);
+        }
+
+        // Event Listeners
+        directoryPickerBtn.addEventListener('click', async () => {
+            try {
+                directoryHandle = await window.showDirectoryPicker();
+                statusDiv.textContent = `Monitoraggio: ${directoryHandle.name}`;
+
+                // Ottieni/Crea directory txt
+                txtDirectoryHandle = await directoryHandle.getDirectoryHandle('txt', { create: true });
+
+                // Inizia il monitoraggio
+                startMonitoring();
+            } catch (error) {
+                statusDiv.textContent = 'Operazione annullata o errore: ' + error.message;
+            }
+        });
+
+        scanIntervalSelect.addEventListener('change', () => {
+            if (directoryHandle) {
+                startMonitoring();
+            }
+        });
+
+        // Delegazione eventi per la lista file
+        fileList.addEventListener('click', async (event) => {
+            const target = event.target;
+            const fileItem = target.closest('.file-item');
+
+            if (!fileItem) return;
+
+            const fileName = fileItem.dataset.fileName;
+
+            // Gestione click sul file
+            if (target.closest('.file-info') || !target.closest('.file-actions')) {
+                // Rimuovi classe active da tutti i file
+                document.querySelectorAll('.file-item').forEach(item => {
+                    item.classList.remove('active');
+                });
+
+                // Aggiungi classe active al file selezionato
+                fileItem.classList.add('active');
+
+                try {
+                    const fileHandle = await txtDirectoryHandle.getFileHandle(fileName);
+                    const file = await fileHandle.getFile();
+                    const content = await file.text();
+
+                    // Formatta come codice C++
+                    fileContentDiv.innerHTML = `<pre><code class="language-cpp">${escapeHtml(content)}</code></pre>`;
+
+                    // Applica l'evidenziazione della sintassi
+                    hljs.highlightElement(fileContentDiv.querySelector('code'));
+                } catch (error) {
+                    fileContentDiv.textContent = `Errore durante la lettura: ${error.message}`;
+                }
+            }
+
+            // Gestione stella (evidenziazione)
+            if (target.closest('.star-btn')) {
+                if (highlightedFilesSet.has(fileName)) {
+                    highlightedFilesSet.delete(fileName);
+                } else {
+                    highlightedFilesSet.add(fileName);
+                }
+
+                saveHighlightedFiles();
+                updateFileList();
+            }
+
+            // Gestione pulsante copia
+            if (target.closest('.copy-btn')) {
+                navigator.clipboard.writeText(fileName)
+                    .then(() => {
+                        showNotification(`Copiato: ${fileName}`);
+                    })
+                    .catch(err => {
+                        showNotification('Errore nella copia');
+                        console.error('Errore copia:', err);
+                    });
+            }
+        });
+
+        // Delegazione eventi per file evidenziati
+        highlightedFiles.addEventListener('click', async (event) => {
+            const target = event.target;
+            const fileItem = target.closest('.highlighted-file');
+
+            if (!fileItem) return;
+
+            const fileName = fileItem.dataset.fileName;
+
+            // Gestione click sul file
+            if (!target.closest('.file-actions')) {
+                try {
+                    const fileHandle = await txtDirectoryHandle.getFileHandle(fileName);
+                    const file = await fileHandle.getFile();
+                    const content = await file.text();
+
+                    // Formatta come codice C++
+                    fileContentDiv.innerHTML = `<pre><code class="language-cpp">${escapeHtml(content)}</code></pre>`;
+
+                    // Applica l'evidenziazione della sintassi
+                    hljs.highlightElement(fileContentDiv.querySelector('code'));
+
+                    // Aggiorna selezione
+                    document.querySelectorAll('.file-item').forEach(item => {
+                        item.classList.remove('active');
+                        if (item.dataset.fileName === fileName) {
+                            item.classList.add('active');
+                        }
+                    });
+                } catch (error) {
+                    fileContentDiv.textContent = `Errore durante la lettura: ${error.message}`;
+                }
+            }
+
+            // Gestione pulsante copia
+            if (target.closest('.copy-btn')) {
+                navigator.clipboard.writeText(fileName)
+                    .then(() => {
+                        showNotification(`Copiato: ${fileName}`);
+                    })
+                    .catch(err => {
+                        showNotification('Errore nella copia');
+                        console.error('Errore copia:', err);
+                    });
+            }
+
+            // Gestione rimozione evidenziazione
+            if (target.closest('.remove-btn')) {
+                highlightedFilesSet.delete(fileName);
+                saveHighlightedFiles();
+                updateFileList();
+            }
+        });
+
+        // Funzione per escape HTML
+        function escapeHtml(unsafe) {
+            return unsafe
+                .replace(/&/g, "&amp;")
+                .replace(/</g, "&lt;")
+                .replace(/>/g, "&gt;")
+                .replace(/"/g, "&quot;")
+                .replace(/'/g, "&#039;");
+        }
+
+        // Funzioni principali
+        function startMonitoring() {
+            if (scanInterval) clearInterval(scanInterval);
+
+            const intervalValue = parseInt(scanIntervalSelect.value);
+            scanInterval = setInterval(async () => {
+                try {
+                    await scanDirectory();
+                    await updateFileList();
+                } catch (error) {
+                    statusDiv.textContent = `Errore durante la scansione: ${error.message}`;
+                }
+            }, intervalValue);
+
+            statusDiv.textContent = `Monitoraggio attivo: ${directoryHandle.name} (scansione ogni ${intervalValue/1000} secondi)`;
+        }
+
+        async function scanDirectory() {
+            for await (const entry of directoryHandle.values()) {
+                if (entry.kind === 'file' && entry.name.endsWith('.jl')) {
+                    const file = await entry.getFile();
+                    const lastModified = file.lastModified;
+
+                    // Controlla modifiche
+                    if (!monitoredFiles.has(entry.name) ||
+                        monitoredFiles.get(entry.name) < lastModified) {
+
+                        monitoredFiles.set(entry.name, lastModified);
+                        await copyFileToTxt(entry, file);
+                    }
+                }
+            }
+            lastScanned = Date.now();
+        }
+
+        async function copyFileToTxt(entry, file) {
+            const newFileName = `${entry.name}.txt`;
+
+            try {
+                // Crea/sovrascrivi file
+                const newFileHandle = await txtDirectoryHandle.getFileHandle(newFileName, { create: true });
+                const writable = await newFileHandle.createWritable();
+                await writable.write(await file.text());
+                await writable.close();
+            } catch (error) {
+                console.error(`Errore copia file: ${error.message}`);
+            }
+        }
+
+        async function updateFileList() {
+            const files = [];
+
+            // Raccolta file
+            for await (const entry of txtDirectoryHandle.values()) {
+                if (entry.kind === 'file' && entry.name.endsWith('.jl.txt')) {
+                    const file = await entry.getFile();
+                    files.push({
+                        name: entry.name,
+                        lastModified: file.lastModified,
+                        originalName: entry.name.replace('.txt', '')
+                    });
+                }
+            }
+
+            // Ordina per data (decrescente)
+            files.sort((a, b) => b.lastModified - a.lastModified);
+
+            // Aggiorna UI
+            updateHighlightedFiles(files);
+            updateAllFilesList(files);
+        }
+
+        function updateHighlightedFiles(allFiles) {
+            // Filtra solo i file evidenziati
+            const highlighted = allFiles.filter(file => highlightedFilesSet.has(file.name));
+
+            if (highlighted.length === 0) {
+                highlightedFiles.innerHTML = `
+                    <div class="no-highlighted">
+                        <i class="fas fa-star"></i>
+                        <p>Nessun file in evidenza</p>
+                    </div>
+                `;
+                return;
+            }
+
+            // Ordina per data (decrescente)
+            highlighted.sort((a, b) => b.lastModified - a.lastModified);
+
+            // Aggiorna UI
+            highlightedFiles.innerHTML = '';
+            highlighted.forEach(file => {
+                const date = new Date(file.lastModified);
+                const timeString = date.toLocaleTimeString();
+                const dateString = date.toLocaleDateString();
+
+                const fileEl = document.createElement('div');
+                fileEl.className = 'highlighted-file';
+                fileEl.dataset.fileName = file.name;
+                fileEl.innerHTML = `
+                    <div class="file-name">${file.originalName}</div>
+                    <div class="file-actions">
+                        <button class="action-btn copy-btn" title="Copia nome file">
+                            <i class="fas fa-copy"></i>
+                        </button>
+                        <button class="action-btn remove-btn" title="Rimuovi da evidenziati">
+                            <i class="fas fa-times"></i>
+                        </button>
+                    </div>
+                `;
+
+                highlightedFiles.appendChild(fileEl);
+            });
+        }
+
+        function updateAllFilesList(allFiles) {
+            if (allFiles.length === 0) {
+                fileList.innerHTML = `
+                    <div class="no-files">
+                        <i class="fas fa-file"></i>
+                        <p>Nessun file disponibile</p>
+                    </div>
+                `;
+                return;
+            }
+
+            // Aggiorna UI
+            fileList.innerHTML = '';
+            allFiles.forEach(file => {
+                const date = new Date(file.lastModified);
+                const timeString = date.toLocaleTimeString();
+                const dateString = date.toLocaleDateString();
+
+                const isHighlighted = highlightedFilesSet.has(file.name);
+
+                const fileEl = document.createElement('div');
+                fileEl.className = 'file-item';
+                fileEl.dataset.fileName = file.name;
+                fileEl.innerHTML = `
+                    <div class="file-info">
+                        <div class="file-icon">
+                            <i class="fas fa-file-code"></i>
+                        </div>
+                        <div class="file-details">
+                            <div class="file-main-name">${file.originalName}</div>
+                            <div class="file-timestamp">${dateString} ${timeString}</div>
+                        </div>
+                    </div>
+                    <div class="file-actions">
+                        <button class="action-btn star-btn" title="${isHighlighted ? 'Rimuovi da evidenziati' : 'Aggiungi a evidenziati'}">
+                            <i class="fas ${isHighlighted ? 'fa-star' : 'fa-star'}"></i>
+                        </button>
+                        <button class="action-btn copy-btn" title="Copia nome file">
+                            <i class="fas fa-copy"></i>
+                        </button>
+                    </div>
+                `;
+
+                fileList.appendChild(fileEl);
+            });
+        }
+
+        // Inizializza l'app
+        loadHighlightedFiles();
+        hljs.configure({
+            languages: ['cpp'],
+            ignoreUnescapedHTML: true
+        });
+    </script>
+</body>
+</html>

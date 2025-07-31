@@ -1,0 +1,61 @@
+Certamente. Creare un "prompt di riferimento" è un'ottima idea per avere un documento centrale che descriva l'intero progetto. Questo è utile sia per te, per mantenere una visione d'insieme, sia per poter spiegare il funzionamento del software a terzi o a un'intelligenza artificiale per domande future.
+
+Basandomi su tutti i moduli e i log che mi hai mostrato, ho costruito una descrizione completa del tuo pacchetto software.
+
+Prompt di Riferimento per il Progetto Photoscenary.jl
+1. Obiettivo Principale del Progetto
+Il progetto Photoscenary.jl è una suite di strumenti software scritta in Julia, il cui scopo è automatizzare la creazione di scenari fotorealistici per simulatori di volo. L'applicazione scarica ortofoto satellitari da server di mappe online, le assembla e le converte nel formato DDS, ottimizzato per l'uso in ambito grafico e di simulazione.
+
+2. Ecosistema e Architettura dei Moduli
+Il progetto è basato su un'architettura modulare in cui ogni componente ha una responsabilità specifica. La comunicazione tra i moduli è gestita tramite chiamate di funzione dirette e un sistema di logging centralizzato.
+
+photoscenary.jl : È l'orchestratore principale e l'entry point dell'applicazione. Gestisce il flusso di lavoro generale: inizializza la configurazione, avvia il monitor della UI, determina l'area da processare, lancia i processi per ogni tile in parallelo e gestisce l'arresto pulito dell'applicazione.
+
+AppConfig.jl : Si occupa della gestione della configurazione. Utilizzando ArgParse.jl, analizza tutti gli argomenti passati da riga di comando (es. --icao, --route, --over) e li rende disponibili al resto dell'applicazione.
+StatusMonitor.jl : È il cuore dell'interfaccia utente (TUI). Utilizzando Term.jl, crea e gestisce un'interfaccia testuale interattiva che mostra in tempo reale:
+
+Un log degli eventi principali.
+Un pannello con le statistiche di sessione (file scaricati, byte totali).
+Barre di avanzamento individuali e parallele per ogni tile in fase di download, complete di percentuale, byte scaricati e velocità.
+AppLogger.jl: Gestisce il logging persistente su file. Configura il logger globale di Julia per scrivere tutti i messaggi informativi e di errore in un file di log (es. photoscenary.log), creando un resoconto completo di ogni esecuzione.
+Route.jl : È responsabile della definizione dell'area geografica. Interpreta gli input dell'utente, come un codice ICAO di un aeroporto o un file di rotta (FGFS/GPX). Per gli ICAO, interroga un database locale (airports.jls) per trovare le coordinate corrispondenti.
+
+coordinateMatrixGenerator (Funzione in photoscenary.jl) : Data un'area geografica centrale e un raggio, questa funzione calcola e genera la lista di tutte le "tile" (tessere) numeriche necessarie a coprire quell'area, preparando il lavoro per i moduli successivi.
+
+TileProcessor.jl : È il "cervello" operativo per ogni singola tile. Riceve l'ID di una tile e decide quale azione intraprendere:
+
+
+SALTARE: Se esiste già un file DDS con risoluzione adeguata.
+CONVERTIRE: Se esiste un file PNG ma non il DDS.
+SCARICARE: Se non esiste nessun file utilizzabile.
+Downloader.jl : È il "lavoratore" che si occupa del download dei dati. Costruisce gli URL per il server di mappe (es. Arcgis) e scarica i singoli "chunk" (pezzi) che compongono una tile, utilizzando il parallelismo per velocizzare l'operazione.
+
+
+
+png2ddsDXT1_exp.jl: Un modulo specializzato che gestisce la conversione dei file immagine dal formato PNG (scaricato da internet) al formato DDS (DirectDraw Surface), che è più performante per l'uso nei simulatori.
+TilesDatabase.jl / ddsFindScanner.jl : Moduli ausiliari che si occupano di scansionare le directory del computer per trovare file di tile già esistenti e creare un database per velocizzare le operazioni future.
+Commons.jl e Geodesics.jl: Librerie di utilità che contengono funzioni di supporto condivise, come calcoli geodetici (distanze, conversioni da ID a coordinate, ecc.) e altre funzioni comuni.
+3. Flusso di Lavoro Tipico
+L'utente lancia il programma da riga di comando, specificando un target (es. --icao efiv).
+AppConfig.jl interpreta gli argomenti.
+photoscenary.jl avvia il StatusMonitor.jl in un task separato per gestire la UI.
+photoscenary.jl chiama Route.jl per ottenere le coordinate geografiche del target (es. EFIV).
+Le coordinate vengono passate a coordinateMatrixGenerator, che produce una lista di ID di tile da processare.
+photoscenary.jl avvia un ciclo parallelo, lanciando un task @async per ogni tile.
+Ogni task chiama TileProcessor.process_tile per la sua tile specifica.
+TileProcessor.jl controlla se il file esiste già. Se non esiste, chiama Downloader.jl.
+Downloader.jl scarica i chunk in parallelo. Per ogni chunk completato, notifica il StatusMonitor.jl, che aggiorna la barra di avanzamento corrispondente (percentuale, byte, velocità).
+Una volta scaricata l'intera tile, TileProcessor.jl chiama png2ddsDXT1_exp.jl per la conversione in DDS.
+Alla fine del processo per una tile, TileProcessor.jl notifica al StatusMonitor.jl i dati finali per aggiornare le statistiche di sessione.
+Una volta che tutti i task delle tile sono completati, photoscenary.jl arresta il monitor e termina.
+4. Tecnologie e Caratteristiche Chiave
+Linguaggio: Julia
+Interfaccia: TUI (Text-based User Interface) avanzata basata su Term.jl.
+Parallelismo: Multi-threading (@async, @sync) per massimizzare l'efficienza nel processamento e download delle tile.
+Formati File: Gestione di PNG e conversione ottimizzata in DDS (DirectDraw Surface).
+Dati Geospaziali: Elaborazione basata su coordinate geodetiche (Lat/Lon) e standard aeronautici (ICAO).
+Configurazione: Altamente configurabile tramite parametri da riga di comando.
+5. Esempio di Utilizzo
+Bash
+
+julia -t 10 photoscenary.jl -i efiv -r 5 -s 4 --over 2

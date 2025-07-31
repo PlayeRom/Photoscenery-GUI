@@ -1,0 +1,188 @@
+document.addEventListener("DOMContentLoaded", function() {
+    // =========================================================================
+    // SETUP INIZIALE E RIFERIMENTI AGLI ELEMENTI HTML
+    // =========================================================================
+    const map = L.map('map').setView([45, 12], 5);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+    }).addTo(map);
+
+    // Riferimenti ai Controlli
+    const icaoInput = document.getElementById('icao');
+    const latInput = document.getElementById('lat');
+    const lonInput = document.getElementById('lon');
+    const sizeInput = document.getElementById('size');
+    const sdwnSelect = document.getElementById('sdwn-value');
+
+    const btnGetCoords = document.getElementById('btn-get-coords');
+    const icaoContainer = document.getElementById('icao-container');
+    const latlonContainer = document.getElementById('latlon-container');
+
+    const btnRun = document.getElementById('btn-run');
+    const btnStop = document.getElementById('btn-stop');
+    const btnConnect = document.getElementById('btn-connect');
+    const btnRefresh = document.getElementById('btn-refresh');
+    const fgfsPortInput = document.getElementById('fgfs-port');
+
+    // Layer e Stato Globale
+    let coverageLayer = L.layerGroup().addTo(map);
+    let aircraftMarker = null;
+    let isConnected = false;
+
+    // =========================================================================
+    // FUNZIONI DI VISUALIZZAZIONE E LOGICA INTERFACCIA
+    // =========================================================================
+
+    function getStyleForSizeId(sizeId) {
+        const colors = ['#0000FF', '#2A00D5', '#5500AA', '#800080', '#AA0055', '#D5002A', '#FF0000'];
+        const opacities = [0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8];
+        const index = (sizeId >= 0 && sizeId < colors.length) ? sizeId : 0;
+        return { color: colors[index], weight: 1, fillColor: colors[index], fillOpacity: opacities[index] };
+    }
+
+    function updateMapCoverage() {
+        fetch('coverage.json')
+        .then(response => response.ok ? response.json() : [])
+        .then(data => {
+            coverageLayer.clearLayers();
+            data.forEach(tile => {
+                const bounds = [[tile.bbox.latLL, tile.bbox.lonLL], [tile.bbox.latUR, tile.bbox.lonUR]];
+                L.rectangle(bounds, getStyleForSizeId(tile.sizeId))
+                .bindTooltip(`ID: ${tile.id}<br>Risoluzione: ${tile.sizeId}`)
+                .addTo(coverageLayer);
+            });
+        }).catch(error => console.error('Errore aggiornamento copertura:', error));
+    }
+
+    function updateAircraftPosition(data) {
+        if (!data.active) {
+            if (aircraftMarker) map.removeLayer(aircraftMarker);
+            aircraftMarker = null;
+            return;
+        }
+        const latLng = [data.lat, data.lon];
+        const tooltipContent = `<b>Prua:</b> ${Math.round(data.heading)}°<br><b>Quota:</b> ${Math.round(data.altitude)} ft AGL<br><b>Velocità:</b> ${Math.round(data.speed)} kts`;
+
+        if (!aircraftMarker) {
+            const aircraftSVG = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="28" height="28"><path d="M21 16v-2l-8-5V3.5c0-.83-.67-1.5-1.5-1.5S10 2.67 10 3.5V9l-8 5v2l8-2.5V19l-2 1.5V22l3.5-1 3.5 1v-1.5L13 19v-5.5l8 2.5z" fill="#d9534f" stroke="black" stroke-width="1"/></svg>';
+            const icon = L.divIcon({ html: aircraftSVG, className: 'aircraft-icon', iconSize: [28, 28] });
+            aircraftMarker = L.marker(latLng, { icon: icon, rotationAngle: data.heading }).addTo(map).bindTooltip(tooltipContent);
+        } else {
+            aircraftMarker.setLatLng(latLng);
+            aircraftMarker.setRotationAngle(data.heading);
+            aircraftMarker.setTooltipContent(tooltipContent);
+        }
+    }
+
+    function populateSdwnDropdown() {
+        const maxSize = parseInt(sizeInput.value, 10);
+        const currentSdwnValue = sdwnSelect.value;
+        sdwnSelect.innerHTML = '';
+        sdwnSelect.add(new Option("Disattivo", "-1"));
+        for (let i = 0; i <= maxSize; i++) {
+            sdwnSelect.add(new Option(`Da ${maxSize} a ${i}`, i));
+        }
+        sdwnSelect.value = (currentSdwnValue >= 0 && currentSdwnValue <= maxSize) ? currentSdwnValue : "-1";
+    }
+
+    function showIcaoMode() {
+        icaoContainer.style.display = 'flex';
+        latlonContainer.style.display = 'none';
+        btnGetCoords.style.display = 'none';
+    }
+
+    function mainUpdateLoop() {
+        if (isConnected) {
+            fetch('/api/fgfs-status')
+            .then(response => response.json())
+            .then(data => updateAircraftPosition(data))
+            .catch(error => console.error("Polling FGFS fallito:", error));
+        }
+        updateMapCoverage();
+    }
+
+    function handleConnect() {
+        isConnected = true;
+        const port = parseInt(fgfsPortInput.value, 10);
+        fetch('/api/connect', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ port }) });
+        btnConnect.textContent = 'Disconnect from FGFS';
+        btnConnect.classList.add('active');
+        btnGetCoords.style.display = 'block';
+    }
+
+    function handleDisconnect() {
+        isConnected = false;
+        fetch('/api/disconnect', { method: 'POST' });
+        btnConnect.textContent = 'Connect to FGFS';
+        btnConnect.classList.remove('active');
+        showIcaoMode();
+        updateAircraftPosition({ active: false });
+    }
+
+    // =========================================================================
+    // EVENT LISTENERS DEI BOTTONI
+    // =========================================================================
+
+    sizeInput.addEventListener('input', populateSdwnDropdown);
+
+    btnGetCoords.addEventListener('click', () => {
+        if (!isConnected) return;
+        fetch('/api/fgfs-status')
+        .then(response => response.json())
+        .then(data => {
+            if(data.active) {
+                latInput.value = data.lat.toFixed(6);
+                lonInput.value = data.lon.toFixed(6);
+                icaoInput.value = `Coords: ${data.lat.toFixed(4)}, ${data.lon.toFixed(4)}`;
+                latlonContainer.style.display = 'block';
+            }
+        });
+    });
+
+    btnRun.addEventListener('click', () => {
+        const jobParams = {
+            radius: parseFloat(document.getElementById('radius').value),
+                            size: parseInt(sizeInput.value, 10),
+                            over: parseInt(document.getElementById('over-mode').value, 10)
+        };
+        const sdwnValue = parseInt(sdwnSelect.value, 10);
+        if (sdwnValue !== -1) { jobParams.sdwn = sdwnValue; }
+
+        if (latlonContainer.style.display === 'block' && latInput.value && lonInput.value) {
+            jobParams.lat = parseFloat(latInput.value);
+            jobParams.lon = parseFloat(lonInput.value);
+        } else {
+            jobParams.icao = icaoInput.value;
+        }
+
+        console.log("Invio richiesta di lavoro al backend:", jobParams);
+        fetch('/api/start-job', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(jobParams)
+        });
+    });
+
+    btnConnect.addEventListener('click', () => {
+        if (isConnected) handleDisconnect();
+        else handleConnect();
+    });
+
+        btnRefresh.addEventListener('click', mainUpdateLoop);
+
+        btnStop.addEventListener('click', () => {
+            if (confirm("Sei sicuro di voler terminare il server Julia?")) {
+                fetch('/api/shutdown', { method: 'POST' });
+                handleDisconnect();
+            }
+        });
+
+        // =========================================================================
+        // AZIONI INIZIALI
+        // =========================================================================
+        showIcaoMode();
+        populateSdwnDropdown();
+
+        // Avvia il ciclo di aggiornamento automatico
+        setInterval(mainUpdateLoop, 5000);
+});

@@ -1,0 +1,273 @@
+# GuiMode.jl – Web GUI Server
+#
+# Features:
+#   - HTTP server (default: http://127.0.0.1:8000)
+#   - Interactive map for tile visualization/download
+#   - API endpoints for job control and FGFS connectivity
+#   - Asynchronous job processing
+#   - Live preview of DDS tiles
+#
+# Key Components:
+#   - Job Queue: Manages download/conversion tasks
+#   - FlightGear Connector: Real-time aircraft position tracking
+#   - Preview Generator: Converts DDS → PNG for web display
+#
+# API Endpoints:
+#   POST /api/start-job    : Queue a new tile job
+#   GET  /api/fgfs-status  : Fetch live aircraft data
+#   GET  /preview?id=:id   : Generate tile preview
+#   POST /api/shutdown     : Terminate server
+
+module GuiMode
+
+export run
+
+using ..Connector, ..GeoEngine, ..ddsFindScanner, ..Photoscenary.dds2pngDXT1, ..Commons, ..Downloader
+using Logging, JSON3, HTTP, Images
+using Base.Threads: @spawn
+using Base.Threads: Atomic, atomic_add!
+
+###############################################################################
+# State
+###############################################################################
+const FGFS_CONNECTION = Ref{Union{Connector.FGFSPositionRoute, Nothing}}(nothing)
+
+# Infinite job queue
+const JOB_QUEUE = Channel{Dict}(Inf)
+# Channel for notifying completed jobs to frontend
+const COMPLETED_JOBS = Channel{Int}(Inf)
+# Counter for assigning unique job IDs
+const JOB_ID_COUNTER = Atomic{Int}(0)
+# Worker that processes the queue
+const JOB_WORKER = Ref{Task}()
+
+# Function to get a new unique job ID
+next_job_id() = atomic_add!(JOB_ID_COUNTER, 1)
+
+###############################################################################
+# Unified Request Handler
+###############################################################################
+function handle(req::HTTP.Request)
+    m  = req.method
+    p  = req.target
+
+    p == "/favicon.ico" && return HTTP.Response(204)
+
+    if m == "GET" && startswith(p, "/preview")
+        return h_preview(req)
+        elseif m == "POST" && p == "/api/start-job"
+        return h_start_job(req)
+        elseif m == "GET" && p == "/api/queue-size"
+        # Use n_avail() to get current queue size
+        return HTTP.Response(200, ["Content-Type" => "application/json"], JSON3.write(Base.n_avail(JOB_QUEUE)))
+        elseif m == "GET" && p == "/api/completed-jobs"
+        return h_completed_jobs(req)
+        elseif m == "POST" && p == "/api/shutdown"
+        return h_shutdown(req)
+        elseif m == "POST" && p == "/api/connect"
+        return h_connect(req)
+        elseif m == "POST" && p == "/api/disconnect"
+        return h_disconnect(req)
+        elseif m == "GET"  && p == "/api/fgfs-status"
+        return h_fgfs_status(req)
+        elseif m == "GET"  && p == "/api/generate-coverage"
+        return h_generate_coverage(req)
+        elseif m == "GET"
+        return serve_static_file(req)
+    end
+
+    HTTP.Response(404, "Not found")
+end
+
+###############################################################################
+# API Routes
+###############################################################################
+function h_start_job(req)
+    # Force keys to be strings
+    params = Dict{String, Any}(string(k) => v for (k, v) in pairs(JSON3.read(req.body)))
+
+    job_id = next_job_id()
+    params["job_id"] = job_id
+
+    # Handle ICAO resolution if lat/lon missing
+    if !haskey(params, "lat") || !haskey(params, "lon")
+        try
+            coords = GeoEngine.get_coords_from_icao(params["icao"])
+            params["lat"] = coords.lat
+            params["lon"] = coords.lon
+            catch e
+            return HTTP.Response(400, "Cannot resolve ICAO: $(params["icao"])")
+        end
+    end
+
+    put!(JOB_QUEUE, params)
+
+    response_payload = Dict(
+        "jobId"  => job_id,
+        "lat"    => params["lat"],
+        "lon"    => params["lon"],
+        "radius" => params["radius"]
+        )
+    HTTP.Response(200, ["Content-Type" => "application/json"], JSON3.write(response_payload))
+end
+
+function h_completed_jobs(_req)
+    completed_ids = Int[]
+    while isready(COMPLETED_JOBS)
+        push!(completed_ids, take!(COMPLETED_JOBS))
+    end
+    HTTP.Response(200, JSON3.write(completed_ids))
+end
+
+function h_shutdown(_req)
+    @info "Shutdown requested"
+    exit(0)
+end
+
+function h_connect(req)
+    FGFS_CONNECTION[] !== nothing && return HTTP.Response(409, "Connection already active")
+    try
+        params = Dict(pairs(JSON3.read(req.body)))
+        port   = get(params, "port", 5000)
+        host   = "127.0.0.1"
+        FGFS_CONNECTION[] = Connector.getFGFSPositionSetTask(host, port, 10.0, 0.5, 1)
+        HTTP.Response(200, "FlightGear connection started")
+        catch e
+        FGFS_CONNECTION[] = nothing
+        HTTP.Response(500, "Connection startup error")
+    end
+end
+
+function h_disconnect(_req)
+    if FGFS_CONNECTION[] !== nothing
+        sock = getfield(FGFS_CONNECTION[], :telnet).sock
+        isopen(sock) && close(sock)
+        FGFS_CONNECTION[] = nothing
+    end
+    HTTP.Response(200, "FlightGear connection terminated")
+end
+
+function h_fgfs_status(_req)
+    conn = FGFS_CONNECTION[]
+    if conn !== nothing && conn.actual !== nothing
+        pos = conn.actual
+        payload = (active=true, lat=pos.latitudeDeg, lon=pos.longitudeDeg,
+                    heading=pos.directionDeg, altitude=pos.altitudeFt, speed=pos.speedMph)
+        return HTTP.Response(200, ["Content-Type" => "application/json"], JSON3.write(payload))
+    else
+        HTTP.Response(200, ["Content-Type" => "application/json"], JSON3.write((active=false,)))
+    end
+end
+
+function h_generate_coverage(_req)
+    ddsFindScanner.generate_coverage_json()
+    HTTP.Response(200, "coverage.json updated")
+end
+
+function h_preview(req)
+    id = parse(Int, HTTP.queryparams(req)["id"])
+    w  = parse(Int, get(HTTP.queryparams(req), "w", "512"))
+    paths = ddsFindScanner.find_file_by_id(id)
+    isempty(paths) && return HTTP.Response(404, "Tile not found")
+    dds_path = first(paths)
+    png_blob = dds2pngDXT1.convert(dds_path, w)
+    HTTP.Response(200, ["Content-Type" => "image/png"], png_blob)
+end
+
+function serve_static_file(req)
+    req.target == "/favicon.ico" && return HTTP.Response(204)
+    filepath = req.target == "/" ? "map.html" : lstrip(req.target, '/')
+    isfile(filepath) || return HTTP.Response(404, "File not found: $(req.target)")
+    try
+        body = read(filepath)
+        mime = endswith(filepath, ".html")  ? "text/html" :
+            endswith(filepath, ".js")    ? "application/javascript" :
+                endswith(filepath, ".css")   ? "text/css" :
+                    endswith(filepath, ".json")  ? "application/json" : "text/plain"
+                HTTP.Response(200, ["Content-Type" => mime], body)
+                catch e
+        HTTP.Response(500, "Internal error")
+    end
+end
+
+###############################################################################
+# Background Worker
+###############################################################################
+function start_background_worker()
+    JOB_WORKER[] = @spawn begin
+        for job in JOB_QUEUE
+            job_id = job["job_id"]
+            try
+                @info "Starting job #$job_id" job
+                # Execute the actual job
+                launch_job_from_api(job)
+                @info "Job #$job_id completed successfully"
+                catch e
+                @error "Job #$job_id failed" exception=(e, catch_backtrace())
+            finally
+                # Always notify job completion (success or failure)
+                put!(COMPLETED_JOBS, job_id)
+            end
+        end
+    end
+end
+
+###############################################################################
+# Server Startup
+###############################################################################
+function run(args::Vector{String}=ARGS)
+    port = 8000
+    if (idx = findfirst(a -> startswith(a, "--http"), args)) !== nothing
+        val = split(args[idx], '=')
+        port = length(val) > 1 ? parse(Int, val[2]) : 8000
+    end
+    host = "127.0.0.1"
+    global_logger(ConsoleLogger(stderr, Logging.Info))
+    @async ddsFindScanner.startFind()
+    start_background_worker()
+    @info "Web GUI server running at http://$host:$port/"
+    HTTP.serve(handle, host, port; verbose=false)
+end
+
+###############################################################################
+# Job Processing Function
+###############################################################################
+function launch_job_from_api(params::Dict)
+    job_id = params["job_id"]
+    # @info "GuiMode.launch_job_from_api: Job #$job_id starting with parameters: " params
+    try
+        p = Dict(string(k) => v for (k, v) in pairs(params))
+        # Gestione esplicita di sdwn (-1 significa disabilitato)
+        sdwn_value = get(p, "sdwn", -1)  # Default a -1 se non presente
+        # Controlla sia il caso di default (-1) sia il caso 'nothing' (null in JSON)
+        if sdwn_value == -1 || sdwn_value === nothing
+            # Valore di default quando il parametro è disabilitato o assente
+            sdwn_value = 0
+        else
+            # Converti in Int solo se hai un valore numerico valido
+            sdwn_value = Int(sdwn_value)
+        end
+        cfg = Dict{String, Any}(
+            "radius" => get(p, "radius", 10.0),
+            "size"   => get(p, "size", 4),
+            "over"   => get(p, "over", 1),
+            "lat"    => p["lat"],
+            "lon"    => p["lon"],
+            "server" => get(p, "server", 1),
+            "sdwn"   => sdwn_value  # Può essere nothing o un Int valido
+            )
+        home_path = @__DIR__
+        route_vec, _, root_path, save_path = GeoEngine.prepare_paths_and_location(cfg, home_path)
+        map_srv = Downloader.MapServer(get(cfg, "server", 1))
+        for (lat, lon) in route_vec
+            area = Commons.MapCoordinates(lat, lon, Float64(cfg["radius"]))
+            GeoEngine.process_target_area(area, cfg, map_srv, root_path, save_path)
+        end
+    catch e
+        @error "GuiMode.launch_job_from_api: ❌ Job failed" exception=(e, catch_backtrace())
+    finally
+        @info "GuiMode.launch_job_from_api: Job #$job_id **always** completed"
+    end
+end
+end
+

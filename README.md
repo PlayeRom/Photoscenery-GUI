@@ -1,59 +1,96 @@
-# Photoscenary
-Programs to generate and manipulate photoscenaries for FGFS.
+# Photoscenery-GUI
 
-The program is written entirely in JULIA and therefore requires JULIA to be installed on your system.
-It is a command line program and currently has no GUI.
+**Photoscenery-GUI** is the new graphical interface for the Photoscenery tool, designed to offer a modern web-based GUI while introducing major performance improvements in several download stages.  
+Although it still has some bugs and rough edges, it is already usable for downloading large scenery areas, especially if you have a good internet connection.
 
-A list of changes / history can be found in [Versions.md](Versions.md).
+> **Note:** Requires Julia **version 1.11.x or later** (currently the reference version).
 
-## Quick guide
-Elaborate instructions in a complete manual can be found at the [FlightGear Wiki](https://wiki.flightgear.org/Julia_photoscenery_generator).
+---
 
-The process of getting photoscenery is simple:
-1. Install the toolchain
-2. Use the tool to download photoscenery tiles in the correct format
-3. Tell FlightGear to use those downloaded tiles
+## 📦 Installing Dependencies
 
-### Installation
-If you use Linux, chances are good your distribution already provides packages.
-Otherwise, install manually:
+This version follows the Julia package management guidelines. Missing or updated dependencies will be automatically handled.
 
-- Install julia (version <=1.6 needed): https://julialang.org/downloads/
-- Install ImageMagick: https://imagemagick.org/script/download.php
-- Install photoscenary.jl (clone this repo, or download the [zipfile](https://github.com/abassign/Photoscenary/archive/refs/heads/main.zip))
+After downloading this repository from GitHub, run the following command **inside the downloaded directory**:
 
-### Usage
-- `julia photoscenary.jl -h` (or `--help`) will print version and usage information.
-- `julia photoscenary.jl --version` will print version and perform checks on needed programs.
-
-#### Basic call
-Running `julia photoscenary.jl` without arguments will run the program with the last commands.  
-They are read from the `args.txt` file in the base directory.
-
-#### Simple example using coordinates
-The program, for basic example, you can run it with this command:
-
-`julia -t 4 photoscenary.jl -p /home/user/photoscenery/Orthophotos --lat 45.66 --lon 9.7 -r 15 -s 3`
-
-where:
-```
--p      the path of photoscenery
---lat   the latitude of the central location of the area
---lon   the longitude of the central location of the area
--r      the radius of the area to be covered with the photoscenary
--s      Max size of image in pixels 0->512 1->1024 2->2048 3->4096 4->8192 5->16384 6->32768
+```bash
+julia --project=. -e 'using Pkg; Pkg.instantiate()'
 ```
 
-#### Simple example using Airport ID
-You may also download around a airport using its ICAO code (`-i <ICAO>`):
-`julia -t 4 photoscenary.jl -p /home/user/photoscenery/Orthophotos -i LIMJ -r 15 -s 3`
+This will download and install all required packages.  
+Thanks to Julia's project management, you should not encounter unexpected issues, and packages will remain automatically up to date.
 
-#### Use SkyVector route
-You can use a GPX route made by skyvector to download scenery along that path (`--route <file.gpx>`):
-`julia -t 4 photoscenary.jl -p /home/user/photoscenery/Orthophotos --route https://wiki.flightgear.org/mySkyVectorRoute.gpx -r 15 -s 3`
+---
 
-### Using the tiles in FlightGear
-To make FlightGear load the downloaded tiles, you need to tell it to:
-- In the FGFS launcher, add the photoscenery folder as you would with "normal" addon scenery.
-  Just add the folder that you specified with the `-p` option as Addon-scenery (hint: it contains a sufolder named `Orthophotos`).
-- When FlightGear started, activate the option: _Menu > View > Rendering Options > Satellite Photoscenery_
+## 🚀 Running Photoscenery-GUI
+
+From inside the `Photoscenery-GUI` directory, run:
+
+```bash
+julia --project=. -e 'using Photoscenary; Photoscenary.GuiMode.run(["--http=8000"])'
+```
+
+The last parameter (`--http=8000`) sets the port for the local web server.
+
+Once launched, open your **browser** (recommended: **Firefox**, not Chrome due to slower map rendering and poorer visuals) and go to:
+
+```
+http://127.0.0.1:8000/
+```
+
+The Julia application starts a lightweight local server; the interface is then handled by the JavaScript files in the `/js` directory and `main.html`.
+
+---
+
+## 📂 Output Storage
+
+The GUI accepts the same batch options as the console version.  
+The most useful for now is:
+
+```
+--path, -p "path Path to store the dds images"
+```
+
+If not specified, an automatic path will be chosen.  
+Use this directory as the **source for FGFS** (FlightGear Scenery).
+
+---
+
+## ✨ Main Improvements
+
+1. **Modern, minimal GUI** while maintaining batch mode compatibility (to be fully tested).
+2. **ICAO input** has known issues, but you can click the airplane icon next to ICAO to activate **map selection mode**:
+   - Mouse pointer becomes a crosshair.
+   - Click to create an **orange circle** with a radius set by the "Radius (Nm)" field.
+   - Adjust the radius by dragging the **white handle** on the edge.
+   - Move the circle by dragging the center.
+   - Add multiple circles to create a route (partially buggy).
+   - Two icons per circle:  
+     - **Green** → freeze/start download  
+     - **Red** → delete circle
+3. **Download process** requires pressing **"Execute Job"**.
+4. **Parallel chunk downloading** into `photosceneryOrthophotos-saved/tmp`, then merging into tiles.  
+   Includes verification to avoid incomplete or black chunks (a known issue in the previous version).
+5. **Existing DDS file management**: Can import `.dds` files from other directories or even other drives (Linux confirmed working) without re-downloading.
+6. **Faster startup**: On Linux, intelligently scans only relevant directories, making startup just a few seconds even with 4–5K `.dds` files.
+7. **No more ImageMagick dependency**:  
+   Two new high-performance Julia modules replace it:
+   - `png2ddsDXT1.jl`
+   - `dds2pngDXT1.jl`  
+   These modules can also be useful for aircraft or scenery object developers.  
+   Achieves **50–90 MPixels/s** on a 4-core CPU — the fastest `.DDS` compressed format converter tested so far.
+
+---
+
+## 💡 Notes & Recommendations
+
+- **Browser**: Firefox strongly recommended for better rendering speed and visuals.
+- **Large-area downloads**: Best results with stable, high-speed internet.
+- **FGFS integration**: Ensure `--path` points to the correct FGFS scenery directory.
+
+---
+
+## 📜 License
+
+This project is released under the same license as the main Photoscenery project.  
+See the LICENSE file for details.
