@@ -1,7 +1,7 @@
 # Salva come: src/Downloader.jl
 module Downloader
 
-using ..Commons, ..StatusMonitor, Images, Downloads, Printf, LightXML
+using ..Commons, ..StatusMonitor, Images, Downloads, Printf, LightXML, ..JobFactory
 using Base.Threads: @spawn
 using FileIO, PNGFiles
 
@@ -32,7 +32,7 @@ FAILED_JOBS_COUNT: Lavori falliti.
 Sincronizzazione: Il canale gestisce automaticamente l'accesso concorrente.
 """
 const CHUNK_QUEUE = Channel{Commons.ChunkJob}(100)
-
+const FALLBACK_QUEUE = Channel{Tuple{Int, Int}}(50) # Canale per (tile_id, size_id) falliti
 const JOBS_DONE_COUNTER = Threads.Atomic{Int}(0)
 const FAILED_JOBS_COUNT = Threads.Atomic{Int}(0)
 const PENDING_JOBS = Threads.Atomic{Int}(0)
@@ -237,19 +237,18 @@ function download_worker(worker_id::Int, map_server::MapServer, cfg::Dict)
             # Controlliamo se l'errore è un HTTP 500 del server
             if e isa Downloads.RequestError && (e.response.status == 500 || occursin("Operation too slow", string(e)))
                 # CASO 1: Errore del server (es. mare, nessuna immagine).
-                # Registriamo un avviso specifico e saltiamo il chunk.
-                @warn "Downloader: chunk $(job.tile_id)-$(job.chunk_xy) skipped (slow/missing)"
-                # Consideriamo il lavoro "fatto" per non bloccare la coda.
-                # Non lo contiamo come fallito, ma semplicemente come completato (senza risultato).
-                StatusMonitor.update_chunk_state(job.tile_id, job.chunk_xy, :completed, 0) # Segna come completato con 0 bytes
-                Threads.atomic_add!(Downloader.JOBS_DONE_COUNTER, 1)
-                Threads.atomic_add!(Downloader.PENDING_JOBS, -1)
+                @warn "Downloader: Server error on chunk $(job.tile_id)-$(job.chunk_xy). Triggering fallback."
+                # Metti il tile fallito nella coda di fallback per un nuovo tentativo
+                # a risoluzione inferiore.
+                put!(FALLBACK_QUEUE, (job.tile_id, job.size_id))
+                # Segna comunque il lavoro corrente come "fatto" per non bloccare i contatori.
+                StatusMonitor.update_chunk_state(job.tile_id, job.chunk_xy, :failed)
+                ##Threads.atomic_add!(Downloader.JOBS_DONE_COUNTER, 1)
             else
                 # CASO 2: Per tutti gli altri errori (es. timeout di rete),
                 # manteniamo la logica dei tentativi.
                 @warn "Downloader: Worker $worker_id failed chunk $(job.tile_id)-$(job.chunk_xy)" exception=(e, catch_backtrace())
                 isfile(job.temp_path) && rm(job.temp_path, force=true)
-
                 if job.retries_left > 0
                     @info "Downloader: Retrying chunk $(job.tile_id)-$(job.chunk_xy) ($(job.retries_left - 1) retries left)"
                     new_job = Commons.ChunkJob(
@@ -258,12 +257,16 @@ function download_worker(worker_id::Int, map_server::MapServer, cfg::Dict)
                         job.retries_left - 1
                     )
                     put!(Downloader.CHUNK_QUEUE, new_job)
-                    Threads.atomic_add!(Downloader.PENDING_JOBS, 1)
+                    ## Threads.atomic_add!(Downloader.PENDING_JOBS, 1)
                 else
-                    @warn "Downloader: Permanent failure for chunk $(job.tile_id)-$(job.chunk_xy)"
+                    # Anche dopo N tentativi falliti, trattiamo il problema come un
+                    # segnale per tentare una risoluzione più bassa.
+                    @warn "Downloader: Permanent failure for chunk $(job.tile_id)-$(job.chunk_xy) after all retries. Triggering fallback."
+                    # Metti il tile fallito nella coda di fallback
+                    put!(FALLBACK_QUEUE, (job.tile_id, job.size_id))
+                    # Aggiorna i contatori
                     StatusMonitor.update_chunk_state(job.tile_id, job.chunk_xy, :failed)
-                    Threads.atomic_add!(Downloader.FAILED_JOBS_COUNT, 1)
-                    Threads.atomic_add!(Downloader.JOBS_DONE_COUNTER, 1)
+                    ##Threads.atomic_add!(Downloader.JOBS_DONE_COUNTER, 1)
                 end
             end
         finally
@@ -273,6 +276,95 @@ function download_worker(worker_id::Int, map_server::MapServer, cfg::Dict)
         elapsed = time() - start_time
         speed_MBps = downloaded_bytes / 1_048_576 / elapsed
         @info "Worker $worker_id finished. Time: $(round(elapsed, digits=2)) s, Downloaded: $(round(downloaded_bytes / 1_048_576, digits=2)) MB, Speed: $(round(speed_MBps, digits=2)) MB/s"
+    end
+end
+
+
+"""
+    fallback_manager(map_server::MapServer, cfg::Dict, root_path::String, save_path::String, tmp_dir::String)
+
+A dedicated asynchronous worker that processes failed tiles from the `FALLBACK_QUEUE`.
+For each failed tile, it first checks if a lower-resolution version already exists in the
+cache (`-saved` directory). If so, it copies it. Otherwise, it attempts to re-download
+it at a progressively lower resolution.
+"""
+function fallback_manager(map_server::MapServer, cfg::Dict, root_path::String, save_path::String, tmp_dir::String)
+    @info "✅ Fallback Manager started. Waiting for failed tiles..."
+    processed_fallbacks = Set{Tuple{Int, Int}}()
+
+    for (tile_id, failed_size_id) in FALLBACK_QUEUE
+        if (tile_id, failed_size_id) in processed_fallbacks
+            continue
+        end
+        push!(processed_fallbacks, (tile_id, failed_size_id))
+
+        new_size_id = failed_size_id - 1
+        if new_size_id < 0
+            @warn "Fallback: Tile $tile_id failed at lowest resolution. Giving up."
+            continue
+        end
+
+        @info "Fallback: Processing tile $tile_id. Attempting fallback to resolution $new_size_id."
+
+        # --- LOGICA CHIAVE AGGIUNTA ---
+        # 1. Prova a recuperare il tile a risoluzione inferiore dalla cache prima di riscaricarlo.
+        #    Sfruttiamo la stessa funzione usata da GeoEngine.
+        status = ddsFindScanner.moveImage(root_path, save_path, tile_id, new_size_id, cfg)
+        if status in ("moved", "skip")
+            @info "Fallback: SUCCESS! Tile $tile_id (res: $new_size_id) was found in cache and moved."
+            # Il tile è stato recuperato, il nostro lavoro qui è finito per questo fallback.
+            # Puliamo comunque i vecchi chunk falliti.
+            try
+                for f in readdir(tmp_dir)
+                    if startswith(f, "$(tile_id)_$(failed_size_id)_")
+                        rm(joinpath(tmp_dir, f), force=true)
+                    end
+                end
+            catch e
+                @warn "Fallback: Could not clean up old chunks for tile $tile_id." exception=(e, catch_backtrace())
+            end
+            continue # Passa al prossimo tile fallito
+        end
+        # --- FINE LOGICA AGGIUNTA ---
+
+        @info "Fallback: Tile $tile_id (res: $new_size_id) not found in cache. Proceeding to download."
+
+        # 2. Se non è stato trovato nella cache, procedi con la logica di download esistente.
+        #    Pulizia dei chunk parziali esistenti per il tile fallito
+        try
+            for f in readdir(tmp_dir)
+                if startswith(f, "$(tile_id)_$(failed_size_id)_")
+                    rm(joinpath(tmp_dir, f), force=true)
+                end
+            end
+            @info "Fallback: Cleaned up old chunks for tile $tile_id at size $failed_size_id."
+        catch e
+            @warn "Fallback: Could not clean up chunks for tile $tile_id." exception=(e, catch_backtrace())
+        end
+
+        # 3. Genera un nuovo set di ChunkJob alla risoluzione inferiore
+        try
+            # NOTA: Per fare questo, la funzione `create_chunk_jobs` di JobFactory
+            # deve essere accessibile qui, e lo è grazie a `using ..JobFactory`.
+
+            # Crea un oggetto TileMetadata temporaneo per generare i nuovi chunk
+            _, _, lon_base, lat_base, lon_step, lat_step, _, _ = Commons.coordFromIndex(tile_id)
+            width, cols = Commons.getSizeAndCols(new_size_id)
+            fallback_tile = Commons.TileMetadata(
+                tile_id, new_size_id,
+                lon_base, lat_base, lon_base + lon_step, lat_base + lat_step,
+                0, 0, 0.0, 0.0, lon_step, width, cols
+            )
+
+            new_jobs = create_chunk_jobs([fallback_tile], cfg, tmp_dir)
+
+            if !isempty(new_jobs)
+                @info "Fallback: Re-enqueueing $(length(new_jobs)) new chunk(s) for tile $tile_id at size $new_size_id."
+                enqueue_chunk_jobs!(CHUNK_QUEUE, new_jobs)
+            end
+        catch e
+            @error "Fallback: Failed to generate new chunk jobs for tile $tile_id." exception=(e, catch_backtrace())
+        end
     end
 end
 
@@ -318,12 +410,15 @@ end
     # Example
     start_chunk_downloads_parallel!(4, map_server, cfg)
 """
-function start_chunk_downloads_parallel!(nworkers::Int, map_server::MapServer, cfg::Dict)
-     @info "✅ Downloader.start_chunk_downloads_parallel: Started $nworkers download workers"
+function start_chunk_downloads_parallel!(nworkers::Int, map_server::MapServer, cfg::Dict, root_path::String, save_path::String, tmp_dir::String)
+    @info "✅ Downloader.start_chunk_downloads_parallel: Starting..."
+    # Avvia i worker di download
     for i in 1:nworkers
         @async download_worker(i, map_server, cfg)
     end
-    @info "✅ Downloader.start_chunk_downloads_parallel: Started $nworkers download workers"
+    # Avvia il manager per i fallback con i percorsi aggiuntivi
+    @async fallback_manager(map_server, cfg, root_path, save_path, tmp_dir)
+    @info "✅ Downloader: Started $nworkers download workers and 1 fallback manager."
 end
 
 

@@ -31,111 +31,71 @@ module GeoEngine
 using Printf: @sprintf
 using Logging
 using FilePathsBase
+using Dates
 using ..Commons, ..Downloader, ..TileProcessor, ..Route, ..Geodesics, ..StatusMonitor
 using ..AssemblyMonitor
-using ..ddsFindScanner
+using ..ddsFindScanner, ..JobFactory
+using .Commons: chunk_pixel_size
 
-export prepare_paths_and_location, process_target_area
+export prepare_paths_and_location, process_target_area, create_precoverage_jobs, create_chunk_jobs
 
 
-"""
-calculate_dynamic_size_id(
-    area::MapCoordinates,
-    cfg::Dict
-    )::Int
-
-    Computes a dynamic size identifier (`sizeId`) based on the geographic extent and
-    configuration parameters.
-
-    This function determines the appropriate tile size (resolution) to use for a given area,
-    possibly adapting to user-specified preferences (e.g. `"sdwn"`) or applying default logic
-    based on zoom level and area size.
-
-    # Arguments
-    - `area::MapCoordinates`: The target area (center and radius in degrees).
-    - `cfg::Dict`: Configuration dictionary, may include:
-    - `"sdwn"`: Optional sub-sampling level (e.g. 1 = full res, 2 = half res).
-    - `"size"`: Default size exponent (e.g. 2 → 1024×1024 tiles).
-
-    # Returns
-    - `Int`: Computed size ID (typically used to index tile resolution).
-
-    # Notes
-    - If `sdwn` is explicitly provided in the config, it overrides default logic.
-    - This function is intended to centralize resolution decisions across the pipeline.
-
-    # Example
-    size_id = calculate_dynamic_size_id(area, cfg)
-"""
-function calculate_dynamic_size_id(dist_nm::Float64, base_size_id::Int, sdwn_min_val::Union{Int,Nothing})::Int
-    # 1. Determina il "pavimento" (minimo size_id) effettivo,
-    #    non può essere più alto del valore di partenza.
-    sdwn_min_val = coalesce(sdwn_min_val, base_size_id)
-    effective_min_size_id = min(base_size_id, coalesce(sdwn_min_val, base_size_id))
-
-    # 2. Calcola di quanti livelli ridurre la risoluzione.
-    #    La regola è: 1 step a 0nm, +1 ogni 10nm.
-    reduction_steps = floor(Int, dist_nm / 10)
-
-    # 3. Calcola la nuova risoluzione applicando la riduzione.
-    calculated_size_id = base_size_id - reduction_steps
-
-    # 4. Applica il "pavimento": la risoluzione finale non può essere
-    #    inferiore al minimo effettivo. Il risultato non può neanche
-    #    essere negativo.
-    final_size_id = max(effective_min_size_id, calculated_size_id, 0)
-
-    return final_size_id
-end
-
-"""
-generate_all_tiles(
-    area::MapCoordinates,
-    cfg::Dict,
-    root_path::String,
-    save_path::String
-    )::Vector{TileMetadata}
-
-    High-level function that generates all tiles covering the specified geographic area.
-
-    This function wraps the lower-level tile generation logic (e.g. `create_single_tiles`)
-    and optionally includes filtering, deduplication, or other enhancements in the future.
-    Currently, it delegates directly to `create_single_tiles`.
-
-    # Arguments
-    - `area::MapCoordinates`: The center coordinates and radius defining the area of interest.
-    - `cfg::Dict`: Configuration options controlling tile layout and resolution.
-    - `root_path::String`: Path to the final DDS output directory.
-    - `save_path::String`: Path to the working directory for intermediate outputs.
-
-    # Returns
-    - `Vector{TileMetadata}`: List of tile descriptors that define the processing scope.
-
-    # Notes
-    - Designed to be extensible: more complex tile selection (e.g. by priority or coverage map)
-    could be added here later.
-    - Typically called at the start of the `process_target_area` pipeline.
-
-    # Example
-    tiles = generate_all_tiles(area, cfg, "/Orthophotos", "/Orthophotos-saved")
-"""
 function generate_all_tiles(area::MapCoordinates, cfg::Dict, rootPath::String, rootPath_save::String)
-    all_tiles = Vector{TileMetadata}()
+    tiles_with_distance = Vector{Tuple{TileMetadata, Float64}}()
     lat_step = 0.125
-    base_size_id = get(cfg, "size", 4) # Leggiamo la risoluzione base dalla GUI
+    base_size_id = get(cfg, "size", 4)
+    offset_dist_deg = 0.0 # Inizializza l'offset a zero
 
-    # Rimuoviamo il calcolo iniziale di width/cols da qui
-
-    # Calcola i limiti dell'area (logica invariata)
+    # 1. Calcolo dei limiti della griglia standard, basata sul raggio
     radius_deg = area.radius * (1 / 60)
     lat_min_grid = floor((area.lat - radius_deg) / lat_step) * lat_step
     lat_max_grid = ceil((area.lat + radius_deg) / lat_step) * lat_step
     lon_min_grid = floor((area.lon - radius_deg / cosd(area.lat)) / tileWidth(area.lat)) * tileWidth(area.lat)
     lon_max_grid = ceil((area.lon + radius_deg / cosd(area.lat)) / tileWidth(area.lat)) * tileWidth(area.lat)
 
-    @info "GeoEngine: Generazione griglia tile..."
+    # --- 2. ESPANSIONE DINAMICA DELLA GRIGLIA ---
+    # Applichiamo un offset solo se siamo in modalità "Download Around Aircraft"
+    if get(cfg, "mode", "manual") == "daa"
+        heading_deg = 0.0
+        has_heading = false
+        try
+            # Recuperiamo la direzione dalla connessione FGFS
+            if GuiMode.FGFS_CONNECTION[] !== nothing && GuiMode.FGFS_CONNECTION[].actual !== nothing
+                heading_deg = GuiMode.FGFS_CONNECTION[].actual.directionDeg
+                has_heading = true
+            end
+        catch
+            # Ignora, non applicheremo l'offset se ci sono problemi
+        end
 
-    # Scansione della griglia
+        if has_heading
+            @info "GeoEngine: Applicazione espansione dinamica per DAA con heading: $heading_deg"
+            offset_dist_deg = 0.25 # 1/4 di grado, come richiesto
+
+            heading_rad = deg2rad(heading_deg)
+            offset_lat_component = offset_dist_deg * cos(heading_rad)
+            offset_lon_component = offset_dist_deg * sin(heading_rad)
+
+            # Estendiamo il riquadro di ricerca nella direzione del moto
+            if offset_lat_component > 0
+                lat_max_grid += offset_dist_deg # Aumenta il limite superiore (Nord)
+            else
+                lat_min_grid -= offset_dist_deg # Diminuisce il limite inferiore (Sud)
+            end
+
+            # La correzione con cosd(area.lat) è necessaria per la longitudine
+            if offset_lon_component > 0
+                lon_max_grid += offset_dist_deg / cosd(area.lat) # Aumenta il limite Est
+            else
+                lon_min_grid -= offset_dist_deg / cosd(area.lat) # Diminuisce il limite Ovest
+            end
+        end
+    end
+    # --- FINE LOGICA DI ESPANSIONE ---
+
+    @info "GeoEngine: Generazione griglia tile con ordinamento dal centro..."
+
+    # 3. La scansione ora utilizzerà la griglia potenzialmente espansa
     for lat in lat_min_grid:lat_step:lat_max_grid
         current_lon_step = tileWidth(lat)
         for lon in lon_min_grid:current_lon_step:lon_max_grid
@@ -145,46 +105,34 @@ function generate_all_tiles(area::MapCoordinates, cfg::Dict, rootPath::String, r
 
             dist_nm = Geodesics.surface_distance(lonC, latC, area.lon, area.lat, Geodesics.localEarthRadius(latC)) / 1852.0
 
-            # Filtra subito i tile fuori dal raggio
-            dist_nm > area.radius && continue
+            # Filtra i tile fuori dal raggio, tenendo conto dell'offset applicato
+            if dist_nm > (area.radius + offset_dist_deg * 60) # converti offset in gradi a NM per il confronto
+                continue
+            end
 
-            # Calcolo dello --sdwn (invariato)
-            sdwn_val = get(cfg, "sdwn", base_size_id) # Se sdwn non è specificato, il minimo è la base stessa
-            effective_size_id = calculate_dynamic_size_id(dist_nm, base_size_id, sdwn_val)
+            # --- Logica di risoluzione adattiva e controllo sovrascrittura (invariata) ---
+            alt_ft = 1000.0 # Valore di default
+            try
+                if GuiMode.FGFS_CONNECTION[] !== nothing && GuiMode.FGFS_CONNECTION[].actual !== nothing
+                    alt_ft = GuiMode.FGFS_CONNECTION[].actual.altitudeFt
+                end
+            catch
+            end
+            adaptive_id = Commons.adaptive_size_id(base_size_id, alt_ft, dist_nm, 90.0)
+            min_size_id = get(cfg, "sdwn", base_size_id)
+            effective_size_id = max(min_size_id, adaptive_id)
 
-            # Calcoliamo width e cols QUI, usando la risoluzione effettiva del tile corrente
             effective_params = getSizeAndCols(effective_size_id)
             if effective_params === nothing
                 @warn "ID risoluzione non valido ($effective_size_id) per tile $tile_id. Salto."
                 continue
-        end
-        effective_width, effective_cols = effective_params
-
-        # Logica di sovrascrittura --over (invariata)
-        overwrite_mode = get(cfg, "over", 0)
-        if overwrite_mode < 2
-            existing_versions = ddsFindScanner.find_all_versions_by_id(tile_id)
-            if !isempty(existing_versions)
-                if overwrite_mode == 0
-                    @info "GeoEngine: Salto tile $tile_id, file esistente (--over 0)."
-                    continue
-                    elseif overwrite_mode == 1
-                    max_existing_width = maximum(get(v, "width", 0) for v in existing_versions)
-                        if max_existing_width >= effective_width
-                            @info "GeoEngine: Salto tile $tile_id, versione esistente più grande o uguale."
-                            continue
-                        end
-                    end
-                end
             end
-
-            # Prova a recuperare dalla cache (invariato)
+            effective_width, effective_cols = effective_params
             if ddsFindScanner.moveImage(rootPath, rootPath_save, tile_id, effective_size_id, cfg) in ("moved", "skip")
-                @info "GeoEngine: Tile $tile_id recuperato dalla cache o già presente."
+                @info "GeoEngine.generate_all_tiles: Tile $tile_id recuperato dalla cache o già presente."
                 continue
             end
 
-            # Crea i metadati del tile con i valori di width e cols CORRETTI
             tile = TileMetadata(
                 tile_id, effective_size_id,
                 lon, lat, lon + current_lon_step, lat + lat_step,
@@ -192,132 +140,136 @@ function generate_all_tiles(area::MapCoordinates, cfg::Dict, rootPath::String, r
                 lonC, latC, current_lon_step,
                 effective_width,
                 effective_cols
-                )
-            push!(all_tiles, tile)
+            )
+            push!(tiles_with_distance, (tile, dist_nm))
         end
     end
 
-    return unique(t -> t.id, all_tiles)
+    sort!(tiles_with_distance, by = item -> item[2])
+    sorted_tiles = [item[1] for item in tiles_with_distance]
+    return unique(t -> t.id, sorted_tiles)
 end
 
+
 """
-create_chunk_jobs(
+Crea una lista di job a bassa risoluzione per una pre-copertura veloce.
+Viene generato un solo "chunk job" per ogni tile.
+"""
+function create_precoverage_jobs(
+    tiles::Vector{TileMetadata},
+    precover_size_id::Int,   # es. viene da cfg["sdwn"]
+    tmp_dir::String
+    )::Vector{ChunkJob}
+    jobs = Vector{ChunkJob}()
+    # livello preview: 1×1 per tile, ma con height proporzionata a Δlat/Δlon
+    # ricavo una width coerente per quel livello
+    width, _ = Commons.getSizeAndCols(precover_size_id)
+    retries = 3  # oppure rendilo un parametro, se preferisci
+
+    for tile in tiles
+        # bbox unico: copre l’intero tile
+        bbox = (
+            lonLL = tile.lonLL, latLL = tile.latLL,
+            lonUR = tile.lonUR, latUR = tile.latUR
+            )
+
+        # dimensioni chunk coerenti (1×1) = usa la variant tipizzata
+        ps = Commons.chunk_pixel_size(
+            width, 1,
+            tile.latUR - tile.latLL,
+            tile.lonUR - tile.lonLL
+        )
+
+        # naming coerente con l’assembler: tileId_sizeId_total_yflipped_x.png
+        total_chunks = 1
+        x, y = 1, 1
+        y_flipped = 1
+        temp_filename = "$(tile.id)_$(precover_size_id)_$(total_chunks)_$(y_flipped)_$(x).png"
+        temp_path = joinpath(tmp_dir, temp_filename)
+
+        # se già presente e “sano”, segna completato e salta
+        if isfile(temp_path) && filesize(temp_path) > 64
+            StatusMonitor.update_chunk_state(tile.id, (x, y), :completed, filesize(temp_path))
+            continue
+        end
+
+        push!(jobs, ChunkJob(
+            tile.id,
+            precover_size_id,
+            (x, y),
+            bbox,
+            (width = ps.width, height = ps.height),
+            temp_path,
+            retries
+        ))
+    end
+    return jobs
+end
+
+
+function create_chunk_jobs(
     tiles::Vector{TileMetadata},
     cfg::Dict,
     tmp_dir::String
     )::Vector{ChunkJob}
-
-    Generates the list of `ChunkJob` tasks corresponding to image chunks that must be downloaded
-    in order to assemble the final orthophoto tiles.
-
-    Each tile is subdivided into smaller chunks based on its internal layout (typically 2×2 or 4×4)
-    and each chunk is represented as a `ChunkJob` that knows how to compute its bounding box,
-    its target filename, and its position within the full tile.
-
-    # Arguments
-    - `tiles::Vector{TileMetadata}`: List of tiles to be assembled.
-    - `cfg::Dict`: Configuration dictionary that may include zoom level, overlap, and other download parameters.
-    - `tmp_dir::String`: Path to the temporary directory where chunk PNGs will be saved.
-
-    # Returns
-    - `Vector{ChunkJob}`: A flat list of jobs that can be processed independently and in parallel.
-
-    # Notes
-    - Each chunk job is independent and suitable for parallel download.
-    - The output of this function is typically fed into a job queue for download processing.
-
-    # Example
-    jobs = create_chunk_jobs(tiles, cfg, "/path/to/tmp")
-"""
-function create_chunk_jobs(tiles::Vector{TileMetadata}, cfg::Dict, tmp_dir::String)
     jobs = Vector{ChunkJob}()
-    retries = get(cfg, "attemps", 5)
+    # accetta sia "attempts" che lo storico "attemps"
+    retries = get(cfg, "attempts", get(cfg, "attemps", 5))
 
     for tile in tiles
+        # passo angolare di un chunk in gradi
         ΔLon_deg = (tile.lonUR - tile.lonLL) / tile.cols
         ΔLat_deg = (tile.latUR - tile.latLL) / tile.cols
-        chunk_pixel_width = Int(tile.width / tile.cols)
+        abs(ΔLon_deg) < 1e-12 && continue  # evita div/0 ai poli
 
-        if abs(ΔLon_deg) < 1e-9; continue; end
-        aspect_ratio = abs(ΔLat_deg / ΔLon_deg)
-        chunk_pixel_height = round(Int, chunk_pixel_width * aspect_ratio)
-        if chunk_pixel_height <= 0; continue; end
+        # dimensioni pixel del chunk (coerenti tra producer e assembler)
+        ps = Commons.chunk_pixel_size(tile)
+        chunk_w = ps.width
+        chunk_h = ps.height
+        chunk_h <= 0 && continue
+
         total_chunks = tile.cols * tile.cols
 
         for y in 1:tile.cols, x in 1:tile.cols
-            chunk_xy = (x, y)
-            # Crea il nome del chunk che sarà elemento della matrice di costruzione del dile completo
+            # flip Y per compatibilità con l’assembler
             y_flipped = tile.cols - y + 1
+
+            # nome file: tileId_sizeId_total_yflipped_x.png
             temp_filename = "$(tile.id)_$(tile.size_id)_$(total_chunks)_$(y_flipped)_$(x).png"
             temp_path = joinpath(tmp_dir, temp_filename)
 
+            # se già presente e "sano", segna completato e salta
             if isfile(temp_path) && filesize(temp_path) > 1024
-                StatusMonitor.update_chunk_state(tile.id, chunk_xy, :completed, filesize(temp_path))
+                StatusMonitor.update_chunk_state(tile.id, (x, y), :completed, filesize(temp_path))
                 continue
             end
 
+            # bbox del chunk
             chunk_lonLL = tile.lonLL + (x - 1) * ΔLon_deg
             chunk_latLL = tile.latLL + (y - 1) * ΔLat_deg
-            chunk_lonUR = chunk_lonLL + ΔLon_deg
-            chunk_latUR = chunk_latLL + ΔLat_deg
+            chunk_bbox  = (
+                lonLL = chunk_lonLL,
+                latLL = chunk_latLL,
+                lonUR = chunk_lonLL + ΔLon_deg,
+                latUR = chunk_latLL + ΔLat_deg
+            )
 
-            bbox = (lonLL=chunk_lonLL, latLL=chunk_latLL, lonUR=chunk_lonUR, latUR=chunk_latUR)
-            pixel_size = (width=chunk_pixel_width, height=chunk_pixel_height)
-
-            # Crea un ChunkJob (da Commons) senza URL
-            push!(jobs, ChunkJob(tile.id, tile.size_id, chunk_xy, bbox, pixel_size, temp_path, retries))
+            # job
+            push!(jobs, ChunkJob(
+                tile.id,
+                tile.size_id,
+                (x, y),
+                chunk_bbox,
+                (width = chunk_w, height = chunk_h),
+                temp_path,
+                retries
+            ))
         end
     end
+
     return jobs
 end
 
-"""
-create_single_tiles(
-    area::MapCoordinates,
-    cfg::Dict,
-    root_path::String,
-    save_path::String
-    )::Vector{TileMetadata}
-
-    Generates the list of `TileMetadata` objects representing orthophoto tiles to be downloaded
-    and assembled for the specified geographic area.
-
-    This function computes the spatial extent and tiling grid based on the input coordinates and
-    configuration parameters (tile size, overlap factor, zoom level, etc.). It returns a list of tiles
-    that define how the full-resolution image should be partitioned and processed.
-
-    # Arguments
-    - `area::MapCoordinates`: The central coordinate and radius defining the target area.
-    - `cfg::Dict`: Configuration dictionary with tiling parameters:
-    - `"size"`: tile size exponent (e.g., 2 for 1024×1024).
-    - `"over"`: overlap factor to avoid sharp seams between tiles.
-    - `"sdwn"`: zoom level or subdownsampling factor (optional).
-    - `root_path::String`: Base path where assembled DDS tiles will be placed.
-    - `save_path::String`: Path where temporary data and intermediate results can be stored.
-
-    # Returns
-    - `Vector{TileMetadata}`: List of metadata objects, each representing a tile to be processed.
-
-    # Notes
-    - This function is purely computational and does not access the network or filesystem.
-    - Used as a first step in the processing pipeline (`process_target_area`).
-
-    # Example
-    tiles = create_single_tiles(area, cfg, "/Orthophotos", "/Orthophotos-saved")
-"""
-function create_single_tiles(area::MapCoordinates, cfg::Dict, tmp_dir::String)
-    jobs = Vector{ChunkJob}()
-    size_id = cfg["size"]
-    w, cols = Commons.getSizeAndCols(size_id)
-
-    # 1 solo tile centrato
-    tile_id = Commons.index(area.lat, area.lon)
-    bbox = Commons.latDegByCentralPoint(area.lat, area.lon, area.radius)
-    temp_path = joinpath(tmp_dir, "$(tile_id)_$(size_id)_1_1_1.png")
-
-    push!(jobs, ChunkJob(tile_id, size_id, (1,1), bbox, (w, w), temp_path, 0))
-    return jobs
-end
 
 """
 process_target_area(
@@ -364,53 +316,77 @@ function process_target_area(
     tmp_dir = joinpath(save_path, "tmp")
     mkpath(tmp_dir)
 
-    # 1. genera la lista di tile
+    # --- 1. PREPARAZIONE ---
+    # Genera la lista di tile ad alta risoluzione necessari.
     tiles = generate_all_tiles(area, cfg, root_path, save_path)
-    isempty(tiles) && return nothing
+    if isempty(tiles)
+        @info "GeoEngine: Nessun tile da processare per l'area specificata."
+        return nothing
+    end
 
-    @info "⚙️ GeoEngine.process_target_area: Calling monitor_and_assemble synchronously for test"
-
-    # 2. crea i chunk-job
-    jobs = create_chunk_jobs(tiles, cfg, tmp_dir)
-    @info "GeoEngine.process_target_area $(length(jobs)) chunk-job"
-
-
-    """
-    monitor_and_assemble(root_path, save_path, tmp_dir, cfg,
-    all_tiles_needed::Vector{Int},
-    check_interval::Int = 2,
-    num_workers::Int = 4)
-    """
+    # Avvia i servizi in background che ascolteranno le code.
     monitor_task = @async AssemblyMonitor.monitor_and_assemble(
-        root_path,
-        save_path,
-        tmp_dir,
-        cfg,
+        root_path, save_path, tmp_dir,
+        merge(cfg, Dict("monitor_debug" => true)),   # <— attiva snapshot/log del monitor
         [t.id for t in tiles]
-            )
+    )
+    nworkers = get(cfg, "workers", 8)
+    Downloader.start_chunk_downloads_parallel!(nworkers, map_server, cfg, root_path, save_path, tmp_dir)
+
+    # --- 2. LOGICA DI PRE-COPERTURA (preview 0→2) ---
+    # Mettiamo SEMPRE in coda, in quest’ordine, i livelli più grossolani (0..2)
+    # prima di generare i job ad alta risoluzione. Questo garantisce una preview rapida.
+    preview_levels = 0:min(2, get(cfg, "size", 4))  # limita a 0..2 e non supera la size target
+    for lvl in preview_levels
+        @info "GeoEngine: Fase 1 - Pre-coverage livello $lvl..."
+        precoverage_jobs = create_precoverage_jobs(tiles, lvl, tmp_dir)
+        if !isempty(precoverage_jobs)
+            @info "GeoEngine: Accodamento di $(length(precoverage_jobs)) job di pre-copertura (lvl=$lvl)."
+            Downloader.enqueue_chunk_jobs!(Downloader.CHUNK_QUEUE, precoverage_jobs)
+        end
+    end
+
+    # --- 3. LOGICA DI DOWNLOAD PRINCIPALE ---
+    @info "GeoEngine: Fase 2 - Generazione job ad alta risoluzione..."
+    high_res_jobs = create_chunk_jobs(tiles, cfg, tmp_dir)
+    @info "GeoEngine: Accodamento di $(length(high_res_jobs)) chunk-job ad alta risoluzione."
+    Downloader.enqueue_chunk_jobs!(Downloader.CHUNK_QUEUE, high_res_jobs)
 
 
-    # 3. avvia prima i worker, poi metti i job
-    nworkers = min(4, length(jobs))
-    @info "GeoEngine.process_target_area avvio: $nworkers workers"
-    Downloader.start_chunk_downloads_parallel!(nworkers, map_server, cfg)
+    # --- 4. ATTESA COMPLETAMENTO ---
+    # Il ciclo di attesa rimane invariato, gestirà il completamento di TUTTI i job accodati.
+    total_chunks = Downloader.PENDING_JOBS[]
+    timeout_seconds = 600
+    start_time = time()
 
-    Downloader.enqueue_chunk_jobs!(Downloader.CHUNK_QUEUE, jobs)
-    @info "GeoEngine.process_target_area: enqueue completato"
+    @info "In attesa del completamento di $total_chunks chunk totali (pre-copertura + alta risoluzione)..."
+    while true
+        if Downloader.PENDING_JOBS[] == 0 && !isready(Downloader.FALLBACK_QUEUE)
+            sleep(2) # Periodo di grazia
+            if Downloader.PENDING_JOBS[] == 0 && !isready(Downloader.FALLBACK_QUEUE)
+                @info "Tutti i lavori e i potenziali fallback sono completati."
+                break
+            end
+        end
 
-    @info "GeoEngine.process_target_area #1"
+        if time() - start_time > timeout_seconds
+            @warn "Timeout attesa download superato! Procedo con l'assemblaggio."
+            break
+        end
 
-    # 4. attendi che tutti i chunk siano pronti o saltati
-    while Downloader.PENDING_JOBS[] > 0
+        if second(now()) % 10 == 0
+            percent_done = round((total_chunks - Downloader.PENDING_JOBS[]) / total_chunks * 100, digits=1)
+            @info "Download in corso... $(Downloader.PENDING_JOBS[]) chunks rimanenti ($percent_done %)"
+            sleep(1)
+        end
+
         sleep(1)
     end
 
-    @info "GeoEngine.process_target_area #2"
-
+    @info "Fase di download terminata. Attendo l'assemblaggio finale..."
     wait(monitor_task)
 
-
-    @info "GeoEngine: process_target_area terminato"
+    @info "GeoEngine: process_target_area terminato."
 end
 
 

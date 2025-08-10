@@ -30,6 +30,14 @@ export function startJob(params) {
 }
 
 /**
+ * Retrieves session information, like the server start time.
+ * @returns {Promise<Object>}
+ */
+export function getSessionInfo() {
+    return fetch('/api/session-info').then(r => r.json());
+}
+
+/**
  * Retrieves list of completed job IDs
  * @returns {Promise<Array>} Array of completed job IDs
  */
@@ -93,4 +101,29 @@ export function getTilePreview(id, width = 512) {
 export function shutdownServer() {
     console.log("API: Sending shutdown command.");
     return fetch('/api/shutdown', { method: 'POST' });
+}
+
+/**
+ * Resolves an ICAO code to geographic coordinates via the backend.
+ * @param {string} icao - The ICAO code to resolve.
+ * @returns {Promise<Object>} A promise that resolves with {lat, lon}.
+ */
+export function resolveIcao(icao) {
+    return fetch(`/api/resolve-icao?icao=${encodeURIComponent(icao)}`)
+    .then(res => {
+        if (!res.ok) {
+            return res.text().then(text => { throw new Error(text) });
+        }
+        return res.json();
+    });
+}
+
+/**
+ * Returns the current FGFS connection state (disconnected | connecting | connected)
+ * @returns {Promise<string>}
+ */
+export function getFgfsConnectionState() {
+    return fetch('/api/connection-state')
+    .then(r => r.json())
+    .then(obj => obj.state);
 }

@@ -18,7 +18,8 @@ using ..Connector
 # --- Exports ---
 export tileWidth, index, coordFromIndex, tile_dirs, tile_dest_dir, findFile, getFileExtension, getFileName
 export getDDSSize, getPNGSize, getSizePixel, getSizeFromWidth, getSizeAndCols # <-- AGGIUNTA QUI
-export FileFinder, CursorAnimator, MapCoordinates, TileMetadata, ChunkJob
+export FileFinder, CursorAnimator, MapCoordinates, TileMetadata, ChunkJob, chunk_pixel_size
+export adaptive_size_id
 
 
 # --- Constants and Definitions ---
@@ -54,6 +55,75 @@ const PIXEL_SIZE_MAP = [
     (size=5, width=16384, cols=8),
     (size=6, width=32768, cols=8) # Assuming size 6 maps to 32768
 ]
+
+
+"""
+adaptive_size_id(k_max::Int, h::Real, d::Real, fov_deg::Real=30)::Int
+
+Return the tile resolution ID (0…6) as a function of:
+    - `k_max`   : Maximum resolution chosen by the operator (0..6)
+    - `h`       : Aircraft AGL height in feet (Int or Float)
+    - `d`       : Slant range to tile center in nautical miles (Int or Float)
+    - `fov_deg` : Pilot’s horizontal field of view in degrees (default 30°)
+
+    Method:
+    1. Convert altitude to meters and NM to meters.
+    2. Compute the target Ground Sample Distance (GSD) visible to the pilot,
+    based on the field of view and a nominal display width (e.g., 1920 px).
+    3. Compute the GSD of each available tile resolution (0..k_max).
+    4. Select the smallest resolution ID whose GSD is still smaller than the target GSD.
+    5. Apply an additional distance-based downscale: +1 level every ~10 NM from the aircraft.
+    6. Clamp the result to [0, k_max].
+
+    Returns:
+    `Int` : Recommended tile resolution ID.
+"""
+function adaptive_size_id(k_max::Int, h::Real, d::Real, fov_deg::Real=60)::Int
+    # --- Constants ---
+    NM_TO_M  = 1852.0           # meters in 1 NM
+    FT_TO_M  = 0.3048           # meters in 1 ft
+    TILE_LAT_DEG = 1 / 8        # tile height in degrees
+    EARTH_RADIUS_M = 6371000.0  # mean Earth radius in meters
+    SCREEN_PX = 1920            # assumed display width in pixels
+    KFOV = 2.0                  # Potenzia l'effetto quota sulla distanza
+
+    # --- 1. Convert altitude (feet) and distance (NM) to meters ---
+    alt_m   = h * FT_TO_M
+    dist_m  = d * NM_TO_M
+
+    # --- 2. Compute visible ground width at given altitude (simple trig) ---
+    fov_rad = deg2rad(fov_deg / 2.0)
+    visible_ground_m = 2 * alt_m * tan(fov_rad / 2) * KFOV
+
+    # --- 3. Compute target GSD (meters per pixel) ---
+    target_gsd = visible_ground_m / SCREEN_PX
+
+    # --- 4. Define tile resolutions (pixels) for IDs 0..6 ---
+    tile_px = [512 << i for i in 0:6]
+
+    # --- 5. Compute tile width in meters (at equator) ---
+    tile_height_m = (TILE_LAT_DEG / 360.0) * 2π * EARTH_RADIUS_M
+    tile_width_m = tile_height_m # approx equal at low latitudes
+
+    # --- 6. Find smallest resolution ID that meets target GSD ---
+    chosen_id = k_max
+    for id in 0:k_max
+        gsd_tile = tile_width_m / tile_px[id+1]
+        if gsd_tile <= target_gsd
+            chosen_id = id
+            break
+        end
+    end
+
+    # --- 7. Apply distance-based degradation ---
+    dist_steps = Int(floor(dist_m / (10 * NM_TO_M)))
+    chosen_id = max(0, chosen_id - dist_steps)
+
+    # --- 8. Clamp to allowed range ---
+    return clamp(chosen_id, 0, k_max)
+end
+
+
 
 """
 Rappresenta un punto di interesse generico (waypoint).
@@ -523,6 +593,35 @@ function findFile(fileName::String; startPath::Union{String,Nothing}=nothing)::V
 
 
     return foundFiles
+end
+
+
+"""
+chunk_pixel_size(tile::TileMetadata) :: NamedTuple{(:width,:height),Tuple{Int,Int}}
+Restituisce le dimensioni in pixel del *chunk* coerenti con l'aspect ratio del tile:
+- Larghezza = floor(width / cols)
+- Altezza   = round(larghezza * |Δlat/Δlon|)
+"""
+@inline function chunk_pixel_size(tile::TileMetadata)::NamedTuple{(:width,:height),Tuple{Int,Int}}
+    @assert tile.cols > 0
+    w::Int = fld(tile.width, tile.cols)   # floor(width/cols), evita doppi arrotondamenti
+    Δlon::Float64 = tile.lonUR - tile.lonLL
+    Δlat::Float64 = tile.latUR - tile.latLL
+    aspect::Float64 = (abs(Δlon) < 1e-12) ? 1.0 : abs(Δlat/Δlon)
+    h::Int = max(1, Int(round(w * aspect)))
+    return (width = w, height = h)
+end
+
+"""
+chunk_pixel_size(width::Integer, cols::Integer, Δlat::Real, Δlon::Real)
+Variant per casi in cui width/cols non coincidono con quelli nel TileMetadata (es. pre-coverage).
+"""
+@inline function chunk_pixel_size(width::Integer, cols::Integer, Δlat::Real, Δlon::Real)::NamedTuple{(:width,:height),Tuple{Int,Int}}
+    @assert cols > 0
+    w::Int = fld(Int(width), Int(cols))
+    aspect::Float64 = (abs(float(Δlon)) < 1e-12) ? 1.0 : abs(float(Δlat)/float(Δlon))
+    h::Int = max(1, Int(round(w * aspect)))
+    return (width = w, height = h)
 end
 
 

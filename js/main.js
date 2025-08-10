@@ -7,29 +7,44 @@ import {
     updateAircraftPosition,
     populateSdwnDropdown,
     getJobParameters,
-    toggleConnectionState,
     renderSvgButtons,
     toggleMapSelectionMode,
     showIcaoMode,
     showTileInPanel,
     previewArea,
     clearPreview,
-    setupInteractiveSelection
+    setupInteractiveSelection,
+    updateHandleStyles,
+    linkRadiusHandleToInput,
+    updateFgfsIndicator
 } from './ui.js';
+
+// ---------- DEBUG SWITCH ----------
+window.DEBUG_FGFS = true;        // flip to false to silence
+const log = (...a) => window.DEBUG_FGFS && console.log('[DEBUG-JS]', ...a);
 
 // --- Aircraft-auto-queue settings ---
 const RADIUS_AROUND_AC = 20;   // NM of each circle
 const OVERLAP_FACTOR   = 2/3;  // ⅔ diameter offset
+
+const DATE_FILTER_LABELS = ["This Session", "Today", "Yesterday", "Last Week", "Last Month", "Last Year", "All Time"];
 
 // --- Global State ---
 const state = {
     isConnected: false,             // FlightGear connection status
     isMapSelectionMode: false,      // Whether map coordinate selection is active
     currentOpacity: 0.4,            // Current opacity level for map coverage
-    resState: Array(7).fill(true),   // Active/inactive state for each resolution filter
+    resState: Array(7).fill(true),  // Active/inactive state for each resolution filter
     hasPreview: false,
     previewAreas: [],
-    isDragging: false
+    isDragging: false,
+    followAircraftActive: false,    // Lo stato della modalità: ON/OFF
+    followAircraftAllowed: false,   // Se la modalità PUÒ essere attivata (FGFS connesso, etc.)
+    isAutoJobPending: false,        // Flag per prevenire il re-trigger rapido dei job DAA
+    lastDaaCircleId: null,          // ID dell'ultimo cerchio DAA creato
+    lastDaaOriginPoint: null,       // Posizione dell'aereo all'ultimo trigger DAA
+    sessionStartTime: null,         // Aggiungi: Ora di avvio della sessione
+    dateFilterIndex: 6              // Aggiungi: Indice del filtro (default: 6 = All Time)
 };
 
 const activeCircles = {};           // Stores active job circles on the map
@@ -42,14 +57,20 @@ let pendingCircle = null;           // Temporary Leaflet circle object
  */
 function mainUpdateLoop() {
     if (state.isConnected) {
-        api.getFgfsStatus().then(updateAircraftPosition);
+        api.getFgfsStatus().then(data => {
+            // Prima aggiorna la posizione sulla mappa
+            updateAircraftPosition(data);
+            // POI salva la rotta nello stato globale
+            state.currentHeading = data.heading;
+        });
+        updateFollowAircraftAvailability();
     }
 
     api.getCoverageData().then(coverageData => {
         const allowedResolutions = new Set(
             state.resState.map((active, i) => active ? i : -1).filter(i => i !== -1)
         );
-        updateMapCoverage(coverageData, allowedResolutions, state.currentOpacity);
+        updateMapCoverage(coverageData, allowedResolutions, state.currentOpacity, state.dateFilterIndex, state.sessionStartTime);
     });
 }
 
@@ -61,17 +82,6 @@ function handleResFilterClick(index) {
     state.resState[index] = !state.resState[index];
     renderSvgButtons(state.resState, handleResFilterClick);
     mainUpdateLoop();
-}
-
-// ------------------------------------------------------------------
-// 1. Queue Badge (always shows ≥ 0)
-// ------------------------------------------------------------------
-function updateQueueBadge() {
-    fetch('/api/queue-size')
-    .then(r => r.json())
-    .then(len => {
-        document.getElementById('badge').textContent = len;
-    });
 }
 
 // ------------------------------------------------------------------
@@ -138,6 +148,9 @@ function clearCircle(jobId) {
  * Checks for and clears circles of completed jobs
  */
 function checkCompletedJobs() {
+    if (state.followAircraftActive) {
+        return; // Esce immediatamente dalla funzione.
+    }
     api.getCompletedJobs().then(ids => {
         if (ids.length) {
             ids.forEach(id => clearCircle(id));        // remove green circle
@@ -145,6 +158,42 @@ function checkCompletedJobs() {
         }
     });
 }
+
+// ------------------------------------------------------------------
+// DDA Download Around Aircraft (DAA)
+// ------------------------------------------------------------------
+
+/**
+ * Updates the availability and appearance of the "Download around aircraft" feature.
+ * This function enables/disables the button and manages the mutual exclusivity
+ * with the "Execute Job" button. It's now the single source of truth for the UI state.
+ */
+function updateFollowAircraftAvailability() {
+    const btnFollow = elements.btnDownloadAroundAircraft;
+    const sdwnSelect = elements.sdwnSelect;
+
+    if (!btnFollow || !sdwnSelect) return;
+
+    // (volendo più robusto)
+    state.followAircraftAllowed = state.isConnected && Number.isFinite(state.currentHeading);
+    btnFollow.disabled = !state.followAircraftAllowed;
+
+    if (state.followAircraftActive && state.followAircraftAllowed) {
+        btnFollow.style.backgroundColor = "#28a745";
+        btnFollow.style.color = "white";
+        sdwnSelect.disabled = true;
+    } else {
+        btnFollow.style.backgroundColor = "";
+        btnFollow.style.color = "";
+        sdwnSelect.disabled = false;
+    }
+
+    if (!state.followAircraftAllowed && state.followAircraftActive) {
+        state.followAircraftActive = false;
+        updateFollowAircraftAvailability();
+    }
+}
+
 
 // ------------------------------------------------------------------
 // 3. Event Handling
@@ -155,66 +204,27 @@ elements.controlsPanel.addEventListener('click', (e) => {
 
     switch (t.id) {
 
-        case 'btn-run':
-            clearPreview();          // elimina preview temporanee globali
-
-            const params = getJobParameters();
-
-            /* 1. cerchio arancione da promuovere? */
-            const preview = state.previewAreas.find(a => !a.isFixed);
-
-            api.startJob(params)
-            .then(data => {
-                updateQueueBadge();
-
-                if (preview) {
-                    /* promuovi il cerchio esistente */
-                    const c = preview.circle;
-                    c.pm.disable();
-                    c.setStyle({
-                        color: '#00cc00',
-                        fillColor: '#00cc00',
-                        fillOpacity: 0.15,
-                        dashArray: null
-                    });
-                    activeCircles[data.jobId] = c;   // registra per rimozione futura
-
-                    const idx = state.previewAreas.indexOf(preview);
-                    if (idx > -1) state.previewAreas.splice(idx, 1);
-                } else {
-                    /* NESSUN cerchio arancione → crea il verde ex-novo */
-                    const circle = L.circle([data.lat, data.lon], {
-                        radius: data.radius * 1852,
-                        color: '#00cc00',
-                        fillColor: '#00cc00',
-                        fillOpacity: 0.15,
-                        weight: 1.5
-                    }).addTo(elements.map);
-                    activeCircles[data.jobId] = circle;
-                }
-            })
-            .catch(err => alert(`Error: ${err.message}`));
-            break;
-
         case 'btn-download-around-aircraft':
-            if (!state.isConnected) {
-                alert('Connect to FlightGear first');
+            // This button now acts as a toggle switch for the "Follow Aircraft" mode.
+
+            if (!state.followAircraftAllowed) {
+                alert('Connect to FlightGear first and ensure the aircraft has a heading.');
                 break;
             }
-            api.getFgfsStatus().then(data => {
-                if (!data.active) {
-                    alert('Aircraft position not available');
-                    return;
-                }
-                buildOverlappingCircles(data.lat, data.lon);
-            });
-            break;
 
-        case 'btn-connect':
-            state.isConnected = !state.isConnected;
-            toggleConnectionState(state.isConnected);
-            state.isConnected ? api.connectToFgfs(parseInt(document.getElementById('fgfs-port').value, 10))
-            : api.disconnectFromFgfs();
+            // Toggle the state
+            state.followAircraftActive = !state.followAircraftActive;
+
+            if (state.followAircraftActive) {
+                // --- ACTIVATING the mode ---
+                // CORREZIONE: Chiama la nuova e corretta funzione
+                startAutomaticFollowJob();
+            } else {
+                // Chiama la nuova funzione per pulire i cerchi dalla mappa.
+                clearAllDaaCircles();
+            }
+            // Aggiorna sempre la UI dopo aver cambiato stato
+            updateFollowAircraftAvailability();
             break;
 
         case 'btn-stop':
@@ -235,17 +245,10 @@ elements.controlsPanel.addEventListener('click', (e) => {
         case 'btn-select-from-map':
             state.isMapSelectionMode = !state.isMapSelectionMode;
             toggleMapSelectionMode(state.isMapSelectionMode);
-            if (state.isMapSelectionMode) {
-                // Mostra gli input lat/lon se non sono visibili
-                elements.latlonContainer.style.display = 'block';
-                // Se ci sono coordinate già inserite, mostra la preview
-                if (elements.latInput.value && elements.lonInput.value) {
-                    updatePreview();
-                }
-            }
             break;
     }
 });
+
 
 // Event listeners
 elements.sizeInput.addEventListener('input', populateSdwnDropdown);
@@ -254,17 +257,40 @@ elements.opacitySlider.addEventListener('input', (e) => {
     mainUpdateLoop();
 });
 
+
 // Tile preview popup handler
 elements.map.on('popupopen', (e) => {
     const previewBtn = e.popup._container.querySelector('.preview-button');
     if (previewBtn) {
         previewBtn.onclick = () => {
             const tileId = previewBtn.dataset.tileId;
-            const imageUrl = api.getTilePreview(tileId);
-            const sizeId = previewBtn.dataset.sizeId;
-            showTileInPanel(tileId, sizeId, imageUrl);
+            const sizeId = parseInt(previewBtn.dataset.sizeId, 10);
+            const previewUrl = api.getTilePreview(tileId, 512); // anteprima veloce
+            const nativeUrl  = api.getTilePreview(tileId, 512 << sizeId); // full-res download
+            showTileInPanel(tileId, sizeId, previewUrl, nativeUrl);
         };
     }
+});
+
+elements.radiusInput.addEventListener('input', () => {
+    // Find the currently active (un-fixed) preview circle
+    const preview = state.previewAreas.find(a => !a.isFixed);
+    if (preview && preview.circle) {
+        // Update its radius from the input value
+        const newRadiusMeters = (parseFloat(elements.radiusInput.value) || 0) * 1852;
+        if (newRadiusMeters > 0) {
+            preview.circle.setRadius(newRadiusMeters);
+        }
+        // Update handle styles to reflect the new size
+        updateHandleStyles(preview.circle);
+    }
+});
+
+elements.dateFilterSlider.addEventListener('input', (e) => {
+    const value = parseInt(e.target.value, 10);
+    state.dateFilterIndex = value; // Aggiorna lo stato
+    elements.dateFilterLabel.textContent = DATE_FILTER_LABELS[value]; // Aggiorna l'etichetta
+    mainUpdateLoop(); // Forza l'aggiornamento della mappa
 });
 
 // ------------------------------------------------------------------
@@ -284,18 +310,75 @@ function destinationPoint(lat, lon, dNm, bearingDeg) {
     return { lat: φ2 * 180 / Math.PI, lon: λ2 * 180 / Math.PI };
 }
 
-/**
- * Crea **un solo cerchio arancione** centrato sulla posizione attuale dell’aereo
- * e lo trasforma immediatamente in job verde.
- */
-function buildOverlappingCircles(lat, lon) {
-    const radiusNm = RADIUS_AROUND_AC;   // usa il valore nel campo o costante
-    const circle   = previewArea(lat, lon, radiusNm);
-    const areaState = { lat, lon, radius: radiusNm, circle, isFixed: false };
-    state.previewAreas.push(areaState);
 
-    processQueueSequentially();   // parte subito
+/**
+ * Handles the "Download Around Aircraft" automatic job submission.
+ * This process is fully automated:
+ * 1. It forces overwrite mode to 2 for tile replacement.
+ * 2. It reads the radius and the desired minimum resolution (--sdwn) from the GUI.
+ * 3. It sends these parameters to the Julia backend.
+ * 4. The backend handles the adaptive resolution logic based on altitude and distance.
+ * 5. It draws a green, confirmed circle and immediately starts the download.
+ */
+function startAutomaticFollowJob() {
+    // 1. Get real-time aircraft data
+    api.getFgfsStatus().then(data => {
+        if (!data.active) {
+            alert('Cannot start job: aircraft data not available.');
+            state.followAircraftActive = false;
+            updateFollowAircraftAvailability();
+            return;
+        }
+
+        // Memorizza la posizione dell'aereo
+        // Questo punto diventa il nostro riferimento per la prossima misurazione.
+        state.lastDaaOriginPoint = L.latLng(data.lat, data.lon);
+        // 2. Read parameters from GUI, overriding where necessary
+        const radiusNm = parseFloat(elements.radiusInput.value) || 20;
+        const aheadPoint = destinationPoint(data.lat, data.lon, radiusNm / 2, data.heading);
+
+        const jobParams = {
+            lat: aheadPoint.lat,
+            lon: aheadPoint.lon,
+            radius: radiusNm,
+            over: 2, // Forza sempre la sovrascrittura
+            // Invia il valore di "Resolution" come 'size'.
+            // Questo diventerà 'k_max' per la funzione adaptive_size_id nel backend.
+            size: parseInt(elements.sizeInput.value, 10) || 4,
+            sdwn: parseInt(elements.sdwnSelect.value, 10) || 0,
+            mode: 'daa'
+        };
+
+        // 3. Draw the circle directly in its "active job" (green) state
+        const circle = L.circle([aheadPoint.lat, aheadPoint.lon], {
+            radius: radiusNm * 1852, // Convert NM to meters for Leaflet
+            color: '#00cc00',        // Green for active job
+            fillColor: '#00cc00',
+            fillOpacity: 0.15,
+            weight: 1.5
+        }).addTo(elements.map);
+
+        // 4. Start the job immediately with the correct parameters
+        api.startJob(jobParams)
+        .then(jobData => {
+            activeCircles[jobData.jobId] = circle;
+            state.lastDaaCircleId = jobData.jobId;
+            state.isAutoJobPending = false;
+            console.log(`Automatic job #${jobData.jobId} started with max resolution (k_max) = ${jobParams.size}.`);
+        })
+        .catch(err => {
+            elements.map.removeLayer(circle);
+            alert(`Error starting automatic job: ${err.message}`);
+            state.followAircraftActive = false;
+            updateFollowAircraftAvailability();
+        });
+    }).catch(err => {
+        alert('Could not get FGFS status.');
+        state.followAircraftActive = false;
+        updateFollowAircraftAvailability();
+    });
 }
+
 
 function processQueueSequentially() {
     const next = state.previewAreas.find(a => !a.isFixed);
@@ -312,8 +395,6 @@ function processQueueSequentially() {
 
     api.startJob(params)
     .then(data => {
-        updateQueueBadge();
-
         // Promote orange → green
         const c = next.circle;
         c.pm.disable();
@@ -338,86 +419,168 @@ function processQueueSequentially() {
     .catch(err => alert(`Error: ${err.message}`));
 }
 
+
+/**
+ * Auto-follow logic for "Download around aircraft".
+ * Generates new ahead-positioned circles when the aircraft moves
+ * close to the center of the current job circle.
+ */
 function checkAutoFollow() {
-    if (!state.isConnected) return;
+    if (!state.isConnected || !state.followAircraftAllowed || !state.followAircraftActive || state.isAutoJobPending) {
+        return;
+    }
 
     api.getFgfsStatus().then(data => {
         if (!data.active) return;
 
+        // Se non abbiamo un punto di partenza o un cerchio di riferimento, non possiamo fare nulla.
+        if (!state.lastDaaOriginPoint || !state.lastDaaCircleId || !activeCircles[state.lastDaaCircleId]) {
+            return;
+        }
+
         const acPos = L.latLng(data.lat, data.lon);
+        const lastCircle = activeCircles[state.lastDaaCircleId];
+        const radius = lastCircle.getRadius(); // Raggio in metri
 
-        // cerco il cerchio verde attivo
-        const jobId = Object.keys(activeCircles).find(j => elements.map.hasLayer(activeCircles[j]));
-        if (!jobId) return;
+        // Misura la distanza tra la posizione attuale e quella che abbiamo salvato.
+        const dist = acPos.distanceTo(state.lastDaaOriginPoint);
 
-        const circle = activeCircles[jobId];
-        const center = circle.getLatLng();
-        const radius = circle.getRadius();     // metres
-        const dist   = acPos.distanceTo(center);
-
-        // se l'aereo è a circa r/2 (0.5) dal centro
-        if (dist < radius * 0.55 && dist > radius * 0.45) {
-            const aheadNm = RADIUS_AROUND_AC / 2;               // NM
-            const aheadPt = destinationPoint(data.lat, data.lon, aheadNm, data.heading);
-            // evita duplicati
-            if (!state.previewAreas.find(a => !a.isFixed)) {
-                const c = previewArea(aheadPt.lat, aheadPt.lon, RADIUS_AROUND_AC);
-                state.previewAreas.push({ ...aheadPt, radius: RADIUS_AROUND_AC, circle: c, isFixed: false });
-            }
+        // La condizione ora funziona perché confronta la distanza percorsa con il raggio.
+        if (dist > radius * OVERLAP_FACTOR) {
+            console.log("DAA Trigger: Distanza percorsa sufficiente. Avvio nuovo job...");
+            state.isAutoJobPending = true;
+            startAutomaticFollowJob();
         }
     });
 }
 
 
+/**
+ * Removes all green job circles created by the DAA mode from the map.
+ */
+function clearAllDaaCircles() {
+    // Itera su tutti i cerchi attivi registrati
+    for (const jobId in activeCircles) {
+        const layer = activeCircles[jobId];
+        if (layer) {
+            elements.map.removeLayer(layer); // Rimuove dalla mappa
+            delete activeCircles[jobId];     // Rimuove dalla registro
+        }
+    }
+    state.lastDaaCircleId = null;
+    state.lastDaaOriginPoint = null;
+    console.log("DAA: Cleared all active job circles.");
+}
+
+
+
 // ------------------------------------------------------------------
 // Map click handler for coordinate selection
 // ------------------------------------------------------------------
-
-import {linkRadiusHandleToInput} from './ui.js';
-
 elements.map.on('click', (e) => {
-    if (state.isDragging) {
+    if (state.isDragging || !state.isMapSelectionMode) {
         return;
     }
-    if (!state.isMapSelectionMode) return;
+    // Chiama la nuova funzione riutilizzabile passando le coordinate del click
+    createPreviewCircleAt(e.latlng.lat, e.latlng.lng);
+});
 
+// ---------- Auto-connect on start-up ----------
+window.addEventListener('DOMContentLoaded', () => {
+    const port = parseInt(elements.fgfsPortInput.value, 10) || 5000;
+    api.connectToFgfs(port);
+});
+
+// ---------- Traffic-light poller ----------
+import {getFgfsConnectionState} from './api.js';  // Tenere o togliere ?
+// Sostituisci il vecchio poller alla fine di main.js con questo
+setInterval(() => {
+    fetch('/api/connection-state')
+    .then(r => {
+        if (!r.ok) { throw new Error(`Il server ha risposto ${r.status}`); }
+        return r.json();
+    })
+    .then(response => { // <<< CORREZIONE CHIAVE: rinominata la variabile per evitare conflitti
+        const btn = elements.btnConnect;
+        const connectionStatus = response.state; // Estraiamo lo stato (es. "connecting")
+
+    // Rimuove tutte le classi di stato precedenti per una gestione pulita
+    btn.classList.remove('active', 'connecting', 'disconnected');
+
+    switch (connectionStatus) {
+        case 'connected':
+            btn.classList.add('active');
+            btn.title = 'FGFS connected';
+            // Ora modifichiamo l'oggetto globale 'state' corretto
+            state.isConnected = true;
+            break;
+        case 'connecting':
+            btn.classList.add('connecting');
+            btn.title = 'FGFS connecting…';
+            // Ora modifichiamo l'oggetto globale 'state' corretto
+            state.isConnected = false;
+            break;
+        default: // 'disconnected'
+            btn.classList.add('disconnected');
+            btn.title = 'FGFS disconnected';
+            // Ora modifichiamo l'oggetto globale 'state' corretto
+            state.isConnected = false;
+    }
+    })
+    .catch((err) => {
+        console.error("Impossibile ottenere lo stato della connessione:", err);
+        const btn = elements.btnConnect;
+        btn.classList.remove('active', 'connecting');
+        btn.classList.add('disconnected');
+        state.isConnected = false;
+    });
+}, 1500);
+
+/**
+ * Creates a complete, interactive preview circle at a specific location.
+ * @param {number} lat - Latitude for the circle's center.
+ * @param {number} lon - Longitude for the circle's center.
+ */
+function createPreviewCircleAt(lat, lon) {
     let radiusNm = parseFloat(elements.radiusInput.value) || 3;
     if (radiusNm < 3) radiusNm = 3;
     elements.radiusInput.value = radiusNm;
 
-    const { lat, lng } = e.latlng;
-    updateCoordinates(lat, lng);
+    updateCoordinates(lat, lon); // CORRETTO: usa 'lon'
 
-    const circle = previewArea(lat, lng, radiusNm);
+    const circle = previewArea(lat, lon, radiusNm); // CORRETTO: usa 'lon'
     linkRadiusHandleToInput(circle);
 
-    const areaState = { lat, lon: lng, radius: radiusNm, circle, isFixed: false };
+    const areaState = { lat, lon, radius: radiusNm, circle, isFixed: false }; // CORRETTO: usa 'lon'
     state.previewAreas.push(areaState);
 
     // Bottoni di conferma e cancellazione
     const btnGroup = L.layerGroup().addTo(elements.map);
     const rLatDeg = circle.getRadius() / 111320;
 
-    const okBtn = L.marker([lat + rLatDeg, lng], {
+    const okBtn = L.marker([lat + rLatDeg, lon], { // CORRETTO: usa 'lon'
         icon: L.divIcon({
             html: '<button class="mini-btn ok">✓</button>',
             className: 'mini-btn-container', iconSize: [22, 22], iconAnchor: [11, 11]
         })
     }).addTo(btnGroup);
 
-    const delBtn = L.marker([lat - rLatDeg, lng], {
+    const delBtn = L.marker([lat - rLatDeg, lon], { // CORRETTO: usa 'lon'
         icon: L.divIcon({
             html: '<button class="mini-btn del">🗑</button>',
             className: 'mini-btn-container', iconSize: [22, 22], iconAnchor: [11, 11]
         })
     }).addTo(btnGroup);
 
-    circle.on('pm:dragstart', () => {
+    // Set a flag when a drag operation starts (on the circle body OR its handles)
+    circle.on('pm:dragstart pm:markerdragstart', () => {
         state.isDragging = true;
-    })
+    });
 
-    circle.on('pm:dragend', () => {
-        // Usiamo un piccolo timeout per resettare lo stato DOPO che l'evento di click è stato ignorato
+    // Reset the flag when the drag ends.
+    // The timeout ensures this runs *after* the map's click event has been
+    // processed, effectively ignoring the click that concludes the drag.
+    circle.on('pm:dragend pm:markerdragend', () => {
         setTimeout(() => {
             state.isDragging = false;
         }, 0);
@@ -426,10 +589,40 @@ elements.map.on('click', (e) => {
     // --- Eventi sui bottoni ---
     okBtn.on('click', (event) => {
         L.DomEvent.stop(event);
+
+        // Congela il cerchio (niente più editing) e rimuove i bottoni
         circle.pm.disable();
-        circle.setStyle({ dashArray: null, color: '#cc6000' });
-        areaState.isFixed = true;
         elements.map.removeLayer(btnGroup);
+
+        // Parametri job → direttamente dal cerchio e dai controlli
+        const centre = circle.getLatLng();
+        const params = {
+            lat: centre.lat,
+            lon: centre.lng,
+            radius: circle.getRadius() / 1852, // m → NM
+             size: parseInt(elements.sizeInput.value, 10) || 4,
+             over: parseInt(elements.overSelect.value, 10) || 1,
+             sdwn: parseInt(elements.sdwnSelect.value, 10) || 0, // default 0 ⇒ precoverage ON
+             mode: 'manual'
+        };
+
+        // Avvia subito il job e trasforma il cerchio in "verde"
+        api.startJob(params)
+        .then(data => {
+            circle.setStyle({
+                color: '#00cc00',
+                fillColor: '#00cc00',
+                fillOpacity: 0.15,
+                dashArray: null
+            });
+            activeCircles[data.jobId] = circle;
+            areaState.isFixed = true; // ormai è “confermato”
+        })
+        .catch(err => {
+            alert(`Error starting job: ${err.message}`);
+            // opzionale: riabilita l’editing se vuoi consentire un nuovo tentativo
+            circle.pm.enable();
+        });
     });
 
     delBtn.on('click', (event) => {
@@ -444,31 +637,95 @@ elements.map.on('click', (e) => {
     const updateButtons = () => {
         if (areaState.isFixed) return;
         const centre = circle.getLatLng();
-        /*  NEW → keep the form in sync */
-        updateCoordinates(centre.lat, centre.lng);
+        updateCoordinates(centre.lat, centre.lng); // Questa riga non serve, la rimuoviamo per pulizia
         const rLatDeg = circle.getRadius() / 111320;
-        okBtn.setLatLng([centre.lat + rLatDeg, centre.lng]);
-        delBtn.setLatLng([centre.lat - rLatDeg, centre.lng]);
+        okBtn.setLatLng([centre.lat + rLatDeg, centre.lng]); // Anche qui, non serve
+        delBtn.setLatLng([centre.lat - rLatDeg, centre.lng]); // E qui
     };
 
-    circle.on('drag', updateButtons);
-    circle.on('pm:markerdrag', updateButtons);
-});
+    circle.on('drag', () => {
+        // Manteniamo la logica di aggiornamento delle coordinate qui
+        const centre = circle.getLatLng();
+        updateCoordinates(centre.lat, centre.lng);
+        const rLatDeg = circle.getRadius() / 111320;
+        okBtn.setLatLng([centre.lat + rLatDeg, centre.lng]); // CORRETTO: usa 'lon'
+        delBtn.setLatLng([centre.lat - rLatDeg, centre.lng]); // CORRETTO: usa 'lon'
+    });
 
+    circle.on('pm:markerdrag', updateButtons);
+    circle.on('pm:markerdrag', updateButtons);
+
+    // Wait for Geoman to fire the 'pm:enable' event, which signals
+    // that the editing handles have been created and are ready.
+    circle.on('pm:enable', () => {
+        // Now that handles exist, we can style them.
+        updateHandleStyles(circle);
+    });
+
+    elements.radiusInput.addEventListener('input', () => {
+        // Find the currently active (un-fixed) preview circle
+        const preview = state.previewAreas.find(a => !a.isFixed);
+        if (preview && preview.circle) {
+            // Update its radius from the input value
+            const newRadiusMeters = (parseFloat(elements.radiusInput.value) || 0) * 1852;
+            if (newRadiusMeters > 0) {
+                preview.circle.setRadius(newRadiusMeters);
+            }
+        }
+    });
+}
+
+elements.icaoInput.addEventListener('keydown', (e) => {
+    // Controlla se il tasto premuto è 'Invio' e se il campo non è vuoto
+    if (e.key === 'Enter' && elements.icaoInput.value.trim() !== '') {
+        e.preventDefault(); // Impedisce l'invio di un form (comportamento di default)
+
+    const icao = elements.icaoInput.value.trim().toUpperCase();
+
+    // Chiama l'API per ottenere le coordinate
+    api.resolveIcao(icao)
+    .then(coords => {
+        // Successo! Crea il cerchio di anteprima con le coordinate ricevute
+        createPreviewCircleAt(coords.lat, coords.lon);
+
+        // Centra la mappa sulla nuova posizione
+        elements.map.setView([coords.lat, coords.lon], 10);
+    })
+    .catch(err => {
+        // Gestisce l'errore se l'ICAO non viene trovato
+        alert(`Error: Could not resolve ICAO '${icao}'.`);
+    });
+    }
+});
 
 
 // ------------------------------------------------------------------
 // 4. Initialization
 // ------------------------------------------------------------------
-initializeMap();
-populateSdwnDropdown();
-renderSvgButtons(state.resState, handleResFilterClick);
-setupInteractiveSelection();
+window.addEventListener('DOMContentLoaded', () => {
+    initializeMap();
+    populateSdwnDropdown();
+    renderSvgButtons(state.resState, handleResFilterClick);
+    setupInteractiveSelection();
+    toggleMapSelectionMode(state.isMapSelectionMode);
+
+    // Primo sync tra DAA e Execute Job
+    updateFollowAircraftAvailability();
+
+    api.getSessionInfo().then(info => {
+        state.sessionStartTime = new Date(info.startTime);
+        console.log("Ora di avvio sessione impostata:", state.sessionStartTime);
+    }).catch(err => {
+        console.error("Impossibile recuperare l'ora della sessione:", err);
+    });
+
+    // Avvia il loop periodic
+    mainUpdateLoop();
+});                          // Initial update on startup
 
 // Set up periodic updates
-setInterval(updateQueueBadge, 1000);        // Update queue every 2 seconds
 setInterval(checkCompletedJobs, 3000);      // Check completed jobs every 3 seconds
 setInterval(mainUpdateLoop, 5000);          // Main update every 5 seconds
 setInterval(checkAutoFollow, 2000);  // run every 2 s
 
-mainUpdateLoop();  // Initial update on startup
+

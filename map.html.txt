@@ -23,7 +23,7 @@
             display: flex; flex-direction: column;
             overflow-y: auto;
         }
-        #main-content { flex-grow: 1; height: 100%; }
+        #main-content { flex-grow: 1; }
         #map { height: 100%; }
 
         /* Style for the map selection button when it's active */
@@ -221,88 +221,6 @@
             padding: 0; /* Rimuove padding di default */
         }
 
-        /* Stile UNIFICATO per i gruppi con etichetta e controlli sulla stessa riga */
-        .inline-label-group {
-            display: flex;
-            /* Allinea gli elementi all'inizio (in alto) per un look migliore con etichette multi-riga */
-            align-items: flex-start;
-            width: 100%;
-            margin-bottom: 15px;
-            gap: 10px; /* Spazio tra etichetta e controllo */
-        }
-
-        /* Stile per l'etichetta (comune a tutti) */
-        .inline-label-group label {
-            flex-basis: 50%;        /* L'etichetta occupa la prima metà dello spazio */
-            flex-shrink: 0;
-            margin-bottom: 0;
-            line-height: 1.2;       /* Compatta leggermente il testo su più righe */
-        }
-
-        /* Stile UNIFICATO per tutti i controlli (input e select) */
-        .inline-label-group input,
-        .inline-label-group select {
-            flex-grow: 1;           /* Il controllo occupa tutto lo spazio rimanente */
-            box-sizing: border-box;
-        }
-
-        /* Stile specifico per allineare a destra il testo degli input numerici */
-        .inline-label-group input[type="number"] {
-            text-align: right;
-        }
-
-        /* Stile per la riga che contiene più controlli */
-        .control-row {
-            display: flex;       /* Allinea gli elementi interni orizzontalmente */
-            gap: 15px;           /* Crea uno spazio tra i due controlli */
-            width: 100%;
-        }
-
-        /* Specifica che ogni controllo dentro la riga deve occupare metà dello spazio */
-        .control-row .control-group {
-            flex: 1;             /* Ogni elemento si espande per occupare uno spazio uguale */
-            margin-bottom: 15px; /* Mantiene la normale spaziatura verticale */
-        }
-
-        /* blocco sdwn super-compatto */
-        .sdwn-inline{
-            display:flex;
-            align-items:center;
-            gap:8px;
-            flex-wrap:wrap;          /* va a capo solo se serve */
-            font-size:12px;          /* più piccolo */
-            line-height:1.1;
-            margin:6px 0;            /* poco spazio verticale */
-        }
-
-        .sdwn-label{
-            font-weight:600;
-            margin:0;
-        }
-
-        .sdwn-precover{
-            display:inline-flex;
-            align-items:center;
-            gap:6px;
-            margin:0;
-            white-space:nowrap;      /* evita che si spezzetti troppo presto */
-        }
-
-        .sdwn-precover input{
-            transform:scale(0.9);    /* checkbox un filo più piccola */
-        }
-
-        .sdwn-select{
-            font-size:12px;
-            padding:2px 6px;
-            height:24px;             /* compatta l’altezza */
-            line-height:1.1;
-            margin:0;
-        }
-
-        /* annulla margini verticali standard di label/select in quel blocco */
-        .sdwn-inline label, .sdwn-inline select { margin-top:0; margin-bottom:0; }
-
         /* Stato Disconnesso (Rosso) */
         #btn-connect.disconnected { background-color: #d9534f; }
         #btn-connect.disconnected::before { content: 'FGFS Off'; }
@@ -333,48 +251,29 @@
             </div>
             <!-- Manual coordinate input (hidden by default) -->
             <div id="latlon-container" style="display: none;">
-                <div class="control-row">
-                    <div class="control-group">
-                        <label for="lat">Latitude:</label>
-                        <input type="number" id="lat" step="any">
-                    </div>
-
-                    <div class="control-group">
-                        <label for="lon">Longitude:</label>
-                        <input type="number" id="lon" step="any">
-                    </div>
-                </div>
+                <label for="lat">Latitude:</label>
+                <input type="number" id="lat" step="any">
+                <label for="lon" style="margin-top: 5px;">Longitude:</label>
+                <input type="number" id="lon" step="any">
             </div>
         </div>
 
-        <div class="control-row">
-            <div class="control-group inline-label-group">
-                <label for="radius">Radius (nm):</label>
-                <input type="number" id="radius" value="25">
-            </div>
+        <!-- Radius selection -->
+        <div class="control-group">
+            <label for="radius">Radius (nm):</label>
+            <input type="number" id="radius" value="40">
+        </div>
 
-            <div class="control-group inline-label-group">
-                <label for="size">Resolution (0-6):</label>
-                <input type="number" id="size" value="4" min="0" max="6">
-            </div>
+        <!-- Resolution selection -->
+        <div class="control-group">
+            <label for="size">Resolution (0-6):</label>
+            <input type="number" id="size" value="4" min="0" max="6">
         </div>
 
         <!-- Distance-based resolution reduction -->
-        <div class="sdwn-inline">
-        <span class="sdwn-label">Reduction with Distance (--sdwn):</span>
-
-        <label class="sdwn-precover">
-            <input id="precover-checkbox" type="checkbox" checked />
-            <span>Pre-coverage before high-res</span>
-        </label>
-
-        <select id="sdwn-select" class="sdwn-select">
-            <option value="0">0 – Full preview (no down-sampling)</option>
-            <option value="1">1 – Preview level 1</option>
-            <option value="2">2 – Preview level 2</option>
-            <option value="3">3 – Preview level 3</option>
-            <option value="4">4 – Preview level 4</option>
-        </select>
+        <div class="control-group">
+            <label for="sdwn-value">Resolution Reduction with Distance (--sdwn):</label>
+            <select id="sdwn-value"></select>
         </div>
 
         <!-- Overwrite mode selection -->
@@ -388,12 +287,17 @@
         </div>
 
         <!-- Main action button -->
+        <button id="btn-run">Execute Job</button>
         <button id="btn-download-around-aircraft">Download around aircraft</button>
 
-        <div class="control-group" style="margin-top: 10px;">
-            <input type="text" id="queue-info" value="Download flow info here..."
-                readonly
-                style="width:100%; box-sizing: border-box; text-align:center; background:#f8f8f8; border:1px solid #ccc; color:#555;"/>
+        <!-- Job queue indicator -->
+        <div class="control-group">
+            <button id="btn-queue" style="position:relative;">
+                Queue
+                <span id="badge" style="position:absolute; top:-6px; right:-6px;
+                                    background:#d9534f; color:white; border-radius:50%;
+                                    padding:2px 6px; font-size:0.8em;">0</span>
+            </button>
         </div>
 
         <hr>
@@ -422,14 +326,6 @@
 
         <!-- Resolution quick-select buttons -->
         <div id="res-svg-container" class="res-svg-container"></div>
-
-        <div class="control-group">
-            <label for="date-filter-slider">Filter by Date:</label>
-            <div style="display: flex; align-items: center; gap: 10px;">
-                <input type="range" id="date-filter-slider" min="0" max="6" step="1" value="5" style="flex-grow: 1;">
-                <span id="date-filter-label" style="font-size: 0.9em; min-width: 90px;">All Time</span>
-            </div>
-        </div>
 
         <!-- Server control buttons -->
         <div class="button-group">

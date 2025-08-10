@@ -1,184 +1,182 @@
-# Salva come: src/Connector.jl (Versione Finale, Pulita e Unificata)
+# Filename: src/Connector.jl
+# Description: This module handles the real-time data connection to a FlightGear instance
+#              via its telnet interface. It is responsible for establishing the connection,
+#              fetching raw aircraft position data, parsing it, and calculating derived
+#              values like speed and heading.
+#
+# Key Architectural Decisions & Critical Points:
+#   - Data Source: It uses the `dump /position` telnet command. This was chosen over
+#     multiple `get` commands because it provides a single, self-contained XML block,
+#     simplifying the I/O logic.
+#   - Parsing Strategy: The primary challenge was that the FGFS telnet server appends
+#     its command prompt (`/>`) to the XML data, which breaks standard XML parsers.
+#     The critical fix involves cleaning this raw string before parsing.
+#   - Data Calculation: Speed and heading are not fetched directly. Instead, they are
+#     calculated by comparing the current position with the previous one, using
+#     the functions provided by the `Geodesics.jl` module.
+#
+# Dependencies:
+#   - Sockets: For low-level TCP communication.
+#   - EzXML: For parsing the XML data block received from FGFS.
+#   - Geodesics.jl: For calculating azimuth (heading) and surface distance between coordinates.
+
 module Connector
 
-export TelnetConnection, FGFSPosition, FGFSPositionRoute, getFGFSPositionSetTask
+export FGFSPosition, FGFSPositionRoute, getFGFSPositionSetTask
 
 using Sockets, EzXML, Dates
 using ..Geodesics
 
-# =============================================================================
-# Structs (TUE VERSIONI ORIGINALI, SENZA DUPLICATI)
-# =============================================================================
+# --- Data Structures ---
 
+"""
+Represents the telnet connection state.
+"""
 mutable struct TelnetConnection
     ipAddress::IPv4
     ipPort::Int
     sock::Union{TCPSocket,Nothing}
-    telnetData::Vector{Any}
-
-    function TelnetConnection(address::String)
-        (ipAddress,ipPort) = getFGFSPositionIpAndPort(address)
-        new(IPv4(ipAddress),ipPort,nothing,Any[])
-    end
+    function TelnetConnection(address::String, port::Int) new(IPv4(address), port, nothing) end
 end
 
+"""
+Holds a complete snapshot of the aircraft's state at a single point in time.
+"""
 struct FGFSPosition
-    latitudeDeg::Float64; longitudeDeg::Float64; altitudeFt::Float64
-    directionDeg::Float64; distanceNm::Float64; speedMph::Float64; time::Float64
-
-    function FGFSPosition(lat::Float64,lon::Float64,alt::Float64)
-        new(lat,lon,alt,0.0,0.0,0.0,time())
-    end
-
-    function FGFSPosition(lat::Float64,lon::Float64,alt::Float64,precPosition::FGFSPosition)
-        t = time()
-        try
-            dir = Geodesics.azimuth(precPosition.longitudeDeg,precPosition.latitudeDeg,lon,lat)
-            dist = Geodesics.surface_distance(precPosition.longitudeDeg,precPosition.latitudeDeg,lon,lat,Geodesics.localEarthRadius(lat)) / 1852.0
-            deltaTime = t - precPosition.time
-            speedMph = deltaTime > 0 ? (dist-precPosition.distanceNm) * 3600 / deltaTime : 0.0
-            new(lat,lon,alt,dir,dist,speedMph,t)
-        catch err
-            println("FGFSPosition - Error: $err")
-            new(lat,lon,alt,precPosition.directionDeg,precPosition.distanceNm,precPosition.speedMph,t)
-        end
-    end
+    latitudeDeg :: Float64
+    longitudeDeg:: Float64
+    altitudeFt  :: Float64
+    directionDeg:: Float64
+    speedMph    :: Float64
 end
 
+"""
+Manages the overall state of the FGFS connection, including the most recent data point.
+"""
 mutable struct FGFSPositionRoute
     marks::Vector{FGFSPosition}
-    size::Int64
     actual::Union{FGFSPosition,Nothing}
-    precPosition::Union{FGFSPosition,Nothing}
-    actualDistance::Float64
-    actualSpeed::Float64
-    actualDirectionDeg::Float64
-    radiusStep::Float64
-    radiusStepFactor::Float64
-    stepTime::Float64
-    telnetLastTime::Float64
     telnet::Union{TelnetConnection,Nothing}
-
-    function FGFSPositionRoute(centralPointRadiusDistance,radiusStepFactor = 0.5)
-        new(FGFSPosition[],0,nothing,nothing,0.0,0.0,0.0,centralPointRadiusDistance,radiusStepFactor,2.0,0.0,nothing)
-    end
+    stepTime::Float64
+    function FGFSPositionRoute(stepTime=2.0) new([], nothing, nothing, stepTime) end
 end
 
-# =============================================================================
-# Funzioni Helper (TUE VERSIONI ORIGINALI)
-# =============================================================================
-telnetConnectionSockIsOpen(telnet) = (telnet !== nothing && telnet.sock !== nothing) ? isopen(telnet.sock) : false
-telnetConnectionSockIsOpen(positionRoute::FGFSPositionRoute) = telnetConnectionSockIsOpen(positionRoute.telnet)
 
-function getFGFSPositionIpAndPort(ipAddressAndPort::String)
-    s = split(ipAddressAndPort,":")
-    ip = length(s[1]) > 0 ? string(s[1]) : "127.0.0.1"
-    p = length(s) > 1 ? tryparse(Int, s[2]) : 5000
-    return ip, something(p, 5000)
-end
-
-function setFGFSConnect(telnet::TelnetConnection,debugLevel::Int)
-    @async begin
-        try
-            if !telnetConnectionSockIsOpen(telnet)
-                telnet.sock = connect(telnet.ipAddress,telnet.ipPort)
-                sleep(0.5)
-            end
-            while telnetConnectionSockIsOpen(telnet)
-                line = Sockets.readline(telnet.sock)
-                if length(line) > 0
-                    push!(telnet.telnetData,line)
-                end
-            end
-        catch err; telnet.sock = nothing; end
-    end
-    return telnet
-end
-
-function getFGFSPosition(telnet::TelnetConnection, precPosition::Union{FGFSPosition,Nothing},debugLevel::Int)
-    telnetDataXML = ""
-    telnet.telnetData = Any[]
+function fetch_and_clean_xml(sock::TCPSocket, command::String, debugLevel::Int)
     try
-        retray = 1
-        while telnetConnectionSockIsOpen(telnet) && retray <= 3
-            write(telnet.sock, "dump /position\r\n")
-            sleep(0.5)
-            if length(telnet.telnetData) >= 8
-                for td in telnet.telnetData[2:end] telnetDataXML *= td end
-                try
-                    primates = EzXML.root(EzXML.parsexml(telnetDataXML))
-                    lat = parse(Float64,EzXML.nodecontent.(findall("//latitude-deg",primates))[1])
-                    lon = parse(Float64,EzXML.nodecontent.(findall("//longitude-deg",primates))[1])
-                    alt_msl = parse(Float64,EzXML.nodecontent.(findall("//altitude-ft",primates))[1])
-                    alt_gnd = parse(Float64,EzXML.nodecontent.(findall("//ground-elev-ft",primates))[1])
+        # Invia il comando a FGFS
+        write(sock, command)
+        sleep(0.3)  # Attendere la risposta
 
-                    position = (precPosition === nothing) ? FGFSPosition(lat,lon,alt_msl-alt_gnd) : FGFSPosition(lat,lon,alt_msl-alt_gnd,precPosition)
-                    return position
-                catch err
-                    return nothing
-                end
-            end
-            retray += 1
+        # Leggi tutti i byte disponibili dal buffer della socket
+        raw_data = readavailable(sock)
+        xml_data_string = String(raw_data)
+
+        # Trova la posizione della chiusura del tag XML
+        end_tag = "</PropertyList>"
+        end_pos = findfirst(end_tag, xml_data_string)
+
+        if end_pos === nothing
+            debugLevel > 0 && @warn "Connector: Dati incompleti da FGFS (tag di chiusura non trovato)."
+            return nothing
         end
-        return nothing
-    catch err
+
+        # Crea una sottostringa valida XML
+        clean_xml = xml_data_string[1:end_pos.stop]
+        return clean_xml
+    catch e
+        debugLevel > 0 && @warn "Connector: Errore durante la lettura o il parsing dei dati." exception=(e, Base.catch_backtrace())
         return nothing
     end
 end
 
-# =============================================================================
-# Funzione Principale (LOGICA ORIGINALE RIPRISTINATA E CORRETTA)
-# =============================================================================
-function getFGFSPositionSetTask(host::String, port::Int, centralPointRadiusDistance::Float64, radiusStepFactor::Float64, debugLevel::Int)
 
-    ipAddressAndPort = "$host:$port"
-    positionRoute = FGFSPositionRoute(centralPointRadiusDistance,radiusStepFactor)
-    maxRetray = 10
+"""
+getFGFSPositionSetTask(host, port, _a, _b, debugLevel)
+
+The main function of the module. It starts a background task (`@async`) that runs an
+    infinite loop to connect to FGFS and continuously fetch and process aircraft data.
+"""
+function getFGFSPositionSetTask(host::String, port::Int, _a, _b, debugLevel::Int)
+    positionRoute = FGFSPositionRoute()
+    positionRoute.telnet = TelnetConnection(host, port)
 
     @async while true
-        # Stabiliamo la connessione usando la tua logica originale
-        positionRoute.telnet = setFGFSConnect(TelnetConnection(ipAddressAndPort),debugLevel)
-        sleep(1.0) # Diamo tempo al task asincrono di connettersi
+        # --- Connection Loop ---
+        if positionRoute.telnet.sock === nothing || !isopen(positionRoute.telnet.sock)
+            try
+                debugLevel > 0 && @info "Connector: Connessione a $host:$port..."
+                positionRoute.telnet.sock = connect(positionRoute.telnet.ipAddress, positionRoute.telnet.ipPort)
+                debugLevel > 0 && @info "Connector: Connesso! ✅"
+                catch e
+                debugLevel > 0 && @warn "Connector: Connessione fallita. Ritento in 5s."
+                positionRoute.telnet.sock = nothing
+                positionRoute.actual = nothing
+                sleep(5); continue
+            end
+        end
 
-        if telnetConnectionSockIsOpen(positionRoute)
-            while telnetConnectionSockIsOpen(positionRoute)
-                retray = 1
-                while telnetConnectionSockIsOpen(positionRoute) && retray <= maxRetray
-                    position = getFGFSPosition(positionRoute.telnet,positionRoute.precPosition,debugLevel)
+        # --- Data Acquisition Loop ---
+        while isopen(positionRoute.telnet.sock)
+            try
+                # Usa la nuova funzione per ottenere la stringa XML pulita
+                isRecived = 0
+                lat = lon = alt = gnd = heading_deg = speed_mph = 0.0
+                # Parse the cleaned XML string
+                pos_doc = fetch_and_clean_xml(positionRoute.telnet.sock, "dump /position\r\n", debugLevel)
+                if pos_doc !== nothing
+                    root = EzXML.root(EzXML.parsexml(pos_doc))
+                    lat = parse(Float64, nodecontent(findfirst("//latitude-deg", root)))
+                    lon = parse(Float64, nodecontent(findfirst("//longitude-deg", root)))
+                    alt = parse(Float64, nodecontent(findfirst("//altitude-ft", root)))
+                    gnd = parse(Float64, nodecontent(findfirst("//ground-elev-ft", root)))
+                    isRecived = 4
+                end
 
-                    if position === nothing
-                        if !telnetConnectionSockIsOpen(positionRoute) break end
-                        debugLevel > 0 && println("\ngetFGFSPositionSetTask - Error: contact lost | n. retray: $retray")
-                        retray += 1
-                        sleep(1.0)
-                    else
-                        sleep(positionRoute.stepTime)
-                        retray = 1
-
-                        if positionRoute.size == 0
-                            push!(positionRoute.marks,position)
-                            positionRoute.size += 1
-                        end
-
-                        positionRoute.actual = position
-                        positionRoute.actualDirectionDeg = position.directionDeg # Usiamo la direzione calcolata dal costruttore
-
-                        if positionRoute.actualDistance >= (positionRoute.radiusStep * positionRoute.radiusStepFactor)
-                            push!(positionRoute.marks,position)
-                            positionRoute.size += 1
-                        end
-
-                        positionRoute.precPosition = position
-
-                        # RIMOSSO IL 'break' CHE FERMAVA L'AGGIORNAMENTO CONTINUO
+                ori_doc = fetch_and_clean_xml(positionRoute.telnet.sock, "dump /orientation\r\n", debugLevel)
+                if ori_doc !== nothing
+                    root = EzXML.root(EzXML.parsexml(ori_doc))
+                    node = findfirst("//true-heading-deg", root)
+                    if node !== nothing
+                        heading_deg = parse(Float64, nodecontent(node))
+                        isRecived += 1
                     end
-                end # Fine ciclo retry
-            end # Fine ciclo "while open"
-        end # Fine "if open"
-        sleep(5.0) # Pausa prima di ritentare il ciclo principale in caso di disconnessione totale
+                end
+
+                vel_doc = fetch_and_clean_xml(positionRoute.telnet.sock, "dump /velocities\r\n", debugLevel)
+                if vel_doc !== nothing
+                    root = EzXML.root(EzXML.parsexml(vel_doc))
+                    node = findfirst("//uBody-fps", root)
+                    if node !== nothing
+                        speed_mph = 1.15078 * parse(Float64, nodecontent(node)) / 1.68781
+                        isRecived += 1
+                    end
+                end
+
+                if isRecived === 0
+                    @warn "Connector.getFGFSPositionSetTask: no valid data from FGFS connection" lat lon alt heading_deg speed_mph
+                    sleep(1)
+                    continue
+                else
+                    debugLevel >= 2 && @info "Connector.getFGFSPositionSetTask: " lat lon alt heading_deg speed_mph
+                end
+                alt_agl = alt - gnd
+                if alt_agl < 0.0 alt_agl = 0 end
+                positionRoute.actual = pos = FGFSPosition(lat, lon, alt_agl,heading_deg, speed_mph)
+                # Create a new FGFSPosition object
+                # Update the global state
+            catch e
+                @warn "Connector.getFGFSPositionSetTask: Critic parsing error .. retray to reconnect" exception=(e, Base.catch_backtrace())
+                if positionRoute.telnet.sock !== nothing; close(positionRoute.telnet.sock); end
+            end
+            sleep(positionRoute.stepTime)
+        end
+
+        debugLevel > 0 && @info "Connector: Connessione persa. In attesa di riconnessione..."
+        positionRoute.actual = nothing
+        sleep(2)
     end
     return positionRoute
 end
 
 end # module Connector
-

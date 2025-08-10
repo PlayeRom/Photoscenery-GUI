@@ -21,102 +21,159 @@ Core module responsible for assembling individual tile chunks into complete imag
 
 module TileProcessor
 
-using Printf: @sprintf
-using Logging, Images, FilePathsBase, SharedArrays, Glob
-using ..Commons, ..StatusMonitor, ..png2ddsDXT1, ..ddsFindScanner
+using FileIO, Images, Colors
+using ..Commons
+using ..png2ddsDXT1
+using ..ddsFindScanner
 
-export assemble_single_tile
+export assemble_group_from_tmp, output_path_for
 
 
 """
-assemble_single_tile(tile::TileMetadata, root_path::String, save_path::String,
-tmp_dir::String, cfg::Dict)::Bool
+output_path_for(tile_id, size_id, root_path, save_path) -> String
 
-Worker function that assembles a single tile from its component chunks.
-
-    Arguments:
-    - tile: Tile metadata containing dimensions and location info
-    - root_path: Main output directory path
-    - save_path: Backup directory path
-    - tmp_dir: Temporary directory containing chunks
-    - cfg: Configuration dictionary
-
-    Returns true if assembly succeeded, false otherwise.
+Ritorna il path finale dove salvare il tile assemblato.
+Modifica liberamente la struttura cartelle per allinearla al tuo progetto.
 """
-function assemble_single_tile(
-    tile::TileMetadata,
-    root_path::String,
-    save_path::String,
-    tmp_dir::String,
-    cfg::Dict
+function output_path_for(tile_id::Int, size_id::Int, root_path::String, save_path::String)::String
+    # Esempio semplice e auto-contenuto:
+    out_dir = joinpath(save_path, "assembled", string(size_id))
+    mkpath(out_dir)
+    return joinpath(out_dir, string(tile_id) * ".png")
+end
+
+
+function assemble_group_from_tmp(
+    tile_id::Int, size_id::Int, total_chunks::Int, files::Vector{String},
+    root_path::String, save_path::String, tmp_dir::String, cfg::Dict
     )::Bool
 
-    StatusMonitor.log_message("Assembling tile $(tile.id)...")
+    isempty(files) && return false
 
-    try
-        # Calculate final image dimensions
-        total_width = tile.width
-        total_height = round(Int, total_width * abs((tile.latUR - tile.latLL) / (tile.lonUR - tile.lonLL)))
-        chunk_pixel_width = Int(total_width / tile.cols)
-        chunk_pixel_height = Int(total_height / tile.cols)
-        final_image = SharedArray{RGB{N0f8}}(total_height, total_width)
+    # 0) parametri di robustezza
+    cols = Int(round(sqrt(total_chunks)))
+    (cols * cols == total_chunks) || return false
+    min_bytes = get(cfg, "min_chunk_bytes", 64)
 
-        # Assemble chunks into final image
-        for y in 1:tile.cols, x in 1:tile.cols
-            chunk_path = joinpath(tmp_dir, "$(tile.id)_$(tile.size_id)_$(tile.cols^2)_$(y)_$(x).png")
-            if !isfile(chunk_path); continue; end
-            chunk_img = Images.load(chunk_path)
+    # 1) indicizza SOLO i file validi presenti (pattern, id/size/total coerenti, dimensione >= min_bytes)
+    #    mappa: (y,x) => path
+    byyx = Dict{Tuple{Int,Int},String}()
+    for f in files
+        if !(isfile(f) && filesize(f) >= min_bytes); return false; end  # race: non pronto → riprova
+        name = basename(f)
+        m = match(r"^(\d+)_(\d+)_([1-9]\d*)_([1-9]\d*)_([1-9]\d*)\.png$", name)
+        m === nothing && return false
+        parse(Int, m.captures[1]) == tile_id    || return false
+        parse(Int, m.captures[2]) == size_id    || return false
+        parse(Int, m.captures[3]) == total_chunks || return false
+        y = parse(Int, m.captures[4]); x = parse(Int, m.captures[5])
+        (1 <= x <= cols && 1 <= y <= cols) || return false
+        byyx[(y,x)] = f
+    end
+    # devono esserci esattamente tutti i pezzi
+    length(byyx) == total_chunks || return false
 
-            # Calculate positioning
-            row_start = 1 + total_height - (chunk_pixel_height * y)
-            row_end = row_start + size(chunk_img, 1) - 1
-            col_start = 1 + chunk_pixel_width * (x - 1)
-            col_end = col_start + size(chunk_img, 2) - 1
-
-            # Handle edge cases
-            if row_end > total_height; row_end = total_height; end
-            if col_end > total_width; col_end = total_width; end
-
-            # Copy chunk data to final image
-            view_h = row_end - row_start + 1
-            view_w = col_end - col_start + 1
-            final_image[row_start:row_end, col_start:col_end] = @view chunk_img[1:view_h, 1:view_w]
-        end
-
-        # Handle output format (DDS or PNG)
-        if !get(cfg, "png", false) # DDS output
-            StatusMonitor.finish_tile_download(tile.id, "Converting to DDS...")
-
-            # Create intermediate files
-            temp_png_path = joinpath(tmp_dir, "$(tile.id)_intermediate.png")
-            Images.save(temp_png_path, final_image)
-
-            temp_dds_path = joinpath(tmp_dir, "$(tile.id).dds")
-            mkpath(dirname(temp_dds_path))
-
-            @info "TileProcessor: Converting $(temp_png_path) to DDS $(temp_dds_path)"
-            png2ddsDXT1.convert(temp_png_path, temp_dds_path)
-
-            # Verify DDS creation
-            if !isfile(temp_dds_path)
-                @error "DDS conversion failed to create output file: $temp_dds_path"
-                rm(temp_png_path, force=true) # Clean intermediate PNG
-                return false
-            end
-
-            rm(temp_png_path, force=true)
-            ddsFindScanner.place_tile!(temp_dds_path, tile, root_path, save_path, cfg)
-        else # PNG output
-            temp_png_path = joinpath(tmp_dir, "$(tile.id).png")
-            Images.save(temp_png_path, final_image)
-            ddsFindScanner.place_tile!(temp_png_path, tile, root_path, save_path, cfg)
-        end
-        return true
-    catch e
-        @error "TileProcessor: Error during image assembly for tile $(tile.id)." exception=(e, catch_backtrace())
-        StatusMonitor.finish_tile_download(tile.id, "Assembly Error")
+    # 2) misura dal primo file esistente (evita race)
+    first_path = first(values(byyx))
+    if !(isfile(first_path) && filesize(first_path) >= get(cfg, "min_chunk_bytes", 1024))
         return false
     end
+
+    first_img = try
+        Images.load(first_path)
+    catch
+        return false  # non ancora leggibile → riprova
+    end
+    chunk_h, chunk_w = size(first_img)  # (rows, cols)
+    total_h = chunk_h * cols
+    total_w = chunk_w * cols
+    final_image = fill(colorant"black", total_h, total_w)
+
+    # 3) y nel filename è già "flippato" (1 = TOP) ⇒ riga = y-1
+    @inline y_to_row(y::Int) = y - 1
+
+    # 4) copia tutti i chunk (se uno manca o non carica → ritorna false, il monitor riproverà)
+    for y in 1:cols, x in 1:cols
+        f = get(byyx, (y,x), "")
+        !isempty(f) || return false
+        isfile(f) || return false
+        img = try
+            Images.load(f)
+        catch
+            return false
+        end
+        (size(img,1) == chunk_h && size(img,2) == chunk_w) || return false
+
+        row = y_to_row(y)
+        col = x - 1
+        row_start = row * chunk_h + 1
+        col_start = col * chunk_w + 1
+        final_image[row_start:row_start+chunk_h-1, col_start:col_start+chunk_w-1] .= img
+    end
+
+    # 5) TileMetadata minimale per "move": usa latC per la larghezza longitudinale
+    lonC, latC, lonLL, latLL, xidx, yidx, _, _ = Commons.coordFromIndex(tile_id)
+    width, _ = Commons.getSizeAndCols(size_id)
+    lon_step = Commons.tileWidth(latC)   # <- meglio del latLL: dipende dalla riga
+    tile_meta = Commons.TileMetadata(
+        tile_id, size_id,
+        lonLL, latLL, lonLL + lon_step, latLL + 0.125,
+        xidx, yidx,
+        lonC, latC, lon_step,
+        width, cols
+        )
+
+    # 6) scrivi PNG temporaneo (taggato con size_id per evitare collisioni) → DDS (se cfg[:png] non è true)
+    #    poi RINOMINA a <tile_id>.dds|.png PRIMA di place_tile!
+    if !get(cfg, "png", false)
+        temp_png = joinpath(tmp_dir, "$(tile_id)_$(size_id)_assembled.png")
+        try
+            Images.save(temp_png, final_image)
+        catch
+            return false
+        end
+        temp_dds = joinpath(tmp_dir, "$(tile_id)_$(size_id).dds")
+        try
+            png2ddsDXT1.convert(temp_png, temp_dds)
+            rm(temp_png; force=true)
+            final_staging = joinpath(tmp_dir, string(tile_id) * ".dds")   # ← SOLO id a 7 cifre
+            if isfile(final_staging); rm(final_staging; force=true); end  # evita collisioni
+            mv(temp_dds, final_staging; force=true)
+            ddsFindScanner.place_tile!(final_staging, tile_meta, root_path, save_path, cfg)
+            rm(final_staging; force=true)  # opzionale: ripulisci lo staging
+        catch
+            # fallback: prova a piazzare il PNG se la conversione fallisce
+            try
+                final_png = joinpath(tmp_dir, string(tile_id) * ".png")
+                if isfile(final_png); rm(final_png; force=true); end
+                mv(temp_png, final_png; force=true)
+                ddsFindScanner.place_tile!(final_png, tile_meta, root_path, save_path, cfg)
+                rm(final_png; force=true)
+            catch
+                return false
+            end
+        end
+    else
+        temp_png = joinpath(tmp_dir, "$(tile_id)_$(size_id).png")
+        try
+            Images.save(temp_png, final_image)
+            final_png = joinpath(tmp_dir, string(tile_id) * ".png")       # ← SOLO id a 7 cifre
+            if isfile(final_png); rm(final_png; force=true); end
+            mv(temp_png, final_png; force=true)
+            ddsFindScanner.place_tile!(final_png, tile_meta, root_path, save_path, cfg)
+            rm(final_png; force=true)
+        catch
+            return false
+        end
+    end
+
+    # 7) cleanup dei chunk SOLO a successo
+    for f in values(byyx)
+        rm(f; force=true)
+    end
+    return true
 end
+
+
 
 end # module TileProcessor

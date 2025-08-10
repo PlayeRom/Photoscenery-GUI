@@ -29,32 +29,33 @@ end
 # Module loading order is critical for dependency resolution
 
 # Base modules with no internal dependencies
-include("AppLogger.jl")
-include("Geodesics.jl")  # Has no internal dependencies
-
-# Modules depending on base modules
-include("Connector.jl")  # Requires Geodesics
-include("Commons.jl")    # Requires Connector
-
-# Modules with higher-level dependencies
-include("StatusMonitor.jl")
-include("ScanDir.jl")
-include("Route.jl")           # Requires Commons and Geodesics
-include("ddsFindScanner.jl")  # Requires Commons
-include("Downloader.jl")      # Requires Commons
+# 1. Moduli Base (poche o nessuna dipendenza interna)
 include("png2ddsDXT1.jl")
-include("TileProcessor.jl")   # Requires Commons
-include("TileAssembler.jl")   # Uses png2ddsDXT1 + Commons
-include("AssemblyMonitor.jl") # Requires Commons
-
-# Configuration and core logic modules
-include("AppConfig.jl")
-include("GeoEngine.jl")
-
-# Application mode modules
-include("BatchMode.jl")
 include("dds2pngDXT1.jl")
-include("GuiMode.jl")
+include("Geodesics.jl")
+include("Connector.jl")         # Dipende da Geodesics
+include("Commons.jl")
+include("AppLogger.jl")
+include("ScanDir.jl")
+include("ddsFindScanner.jl")    # Dipende da Commons
+include("TileAssembler.jl")     # Dipende da Commons, png2ddsDXT1, ddsFindScanner
+include("StatusMonitor.jl")
+
+# 2. Moduli di Utilità (dipendono dai moduli base)
+include("JobFactory.jl")        # Dipende da Commons
+include("TileProcessor.jl")     # Dipende da Commons
+include("Route.jl")             # Dipende da Commons, Geodesics
+include("Downloader.jl")        # Dipende da Commons, JobFactory, StatusMonitor
+include("AssemblyMonitor.jl")   # Dipende da Commons
+
+# 3. Moduli Principali (usano i moduli di utilità)
+include("GeoEngine.jl")         # Dipende da molti moduli, va caricato dopo di essi
+# 4. Moduli di alto livello (interfaccia e configurazione)
+
+include("AppConfig.jl")
+
+include("BatchMode.jl")
+include("GuiMode.jl")           # Dipende da quasi tutto, va caricato per ultimo
 
 using .dds2pngDXT1
 

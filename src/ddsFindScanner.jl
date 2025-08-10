@@ -401,14 +401,16 @@ end
 """
 generate_coverage_json()
 
-Genera il file `coverage.json` per la visualizzazione web, applicando una logica
-di priorità: i tile in /Orthophotos/ hanno la precedenza; per gli altri,
-viene scelta la versione con la risoluzione più alta disponibile.
+Genera il file `coverage.json` per la visualizzazione web. Applica una logica di
+priorità per mostrare solo la versione più rilevante di ogni tile:
+1. I tile nella cartella /Orthophotos/ hanno sempre la precedenza su quelli in /Orthophotos-saved/.
+2. A parità di locazione, viene scelta la versione con la risoluzione (`sizeId`) più alta.
+Il file generato include l'ID, il BBOX, il sizeId e la data di modifica per ogni tile.
 """
 function generate_coverage_json()
-    println("Avvio generazione report di copertura con logica di priorità...")
+    @info "ddsFindScanner: Avvio generazione di coverage.json con logica di priorità..."
 
-    # Funzione helper interna (invariata)
+    # Funzione helper interna per calcolare il BBOX (invariata)
     function get_tile_bbox_from_id(tile_id::Int)
         _, _, lon_base, lat_base, x, y, _, _ = Commons.coordFromIndex(tile_id)
         lat_ref = lat_base + (y * 0.125) + 0.0625
@@ -419,38 +421,42 @@ function generate_coverage_json()
     end
 
     # Dizionario per tenere traccia del miglior candidato per ogni tile_id
-    # Struttura: tile_id => Dict("sizeId" => ..., "isInOrtho" => true/false)
     tile_candidates = Dict{Int, Dict{String, Any}}()
 
     lock(_data_lock) do
-        # Iteriamo su tutti i file presenti nell'indice in memoria
         for (path, record) in _existing_data
             tile_id = get(record, "id", nothing)
             size_id = get(record, "sizeId", nothing)
+            # Leggiamo la data, con un valore di default per sicurezza
+            last_mod = get(record, "last_modified", "1970-01-01 00:00:00")
+
             (tile_id === nothing || size_id === nothing) && continue
 
             is_in_ortho = occursin("/Orthophotos/", path) && !occursin("/Orthophotos-saved/", path)
 
-            # Controlliamo se abbiamo già un candidato per questo tile
+            # Creiamo il record del candidato corrente, includendo la data
+            current_candidate = Dict(
+                "sizeId" => size_id,
+                "isInOrtho" => is_in_ortho,
+                "last_modified" => last_mod
+                )
+
             if !haskey(tile_candidates, tile_id)
                 # Se è il primo che troviamo, lo aggiungiamo come candidato
-                tile_candidates[tile_id] = Dict("sizeId" => size_id, "isInOrtho" => is_in_ortho)
+                tile_candidates[tile_id] = current_candidate
             else
                 # Se abbiamo già un candidato, applichiamo le regole di priorità
                 existing_candidate = tile_candidates[tile_id]
 
-                # REGOLA 1: Il nuovo tile è in Orthophotos, ma il vecchio no -> il nuovo vince.
-                if is_in_ortho && !existing_candidate["isInOrtho"]
-                    tile_candidates[tile_id] = Dict("sizeId" => size_id, "isInOrtho" => true)
-
-                    # REGOLA 2: Entrambi sono nella stessa "zona" (entrambi in Ortho o entrambi fuori)
-                    #           -> vince quello con la risoluzione più alta.
-                    elseif is_in_ortho == existing_candidate["isInOrtho"]
-                    if size_id > existing_candidate["sizeId"]
-                        tile_candidates[tile_id] = Dict("sizeId" => size_id, "isInOrtho" => is_in_ortho)
+                # REGOLA 1: Il nuovo è in Orthophotos, il vecchio no -> il nuovo vince.
+                if current_candidate["isInOrtho"] && !existing_candidate["isInOrtho"]
+                    tile_candidates[tile_id] = current_candidate
+                    # REGOLA 2: Entrambi sono nella stessa "zona" -> vince la risoluzione più alta.
+                    elseif current_candidate["isInOrtho"] == existing_candidate["isInOrtho"]
+                    if current_candidate["sizeId"] > existing_candidate["sizeId"]
+                        tile_candidates[tile_id] = current_candidate
                     end
                 end
-                # (Caso implicito: se il vecchio è in Ortho e il nuovo no, non facciamo nulla)
             end
         end
     end
@@ -459,17 +465,22 @@ function generate_coverage_json()
     output_data = []
     for (tile_id, info) in tile_candidates
         push!(output_data, Dict(
-            "id"     => tile_id,
-            "bbox"   => get_tile_bbox_from_id(tile_id),
-            "sizeId" => info["sizeId"]
+            "id"            => tile_id,
+            "bbox"          => get_tile_bbox_from_id(tile_id),
+            "sizeId"        => info["sizeId"], # Virgola corretta
+            "last_modified" => info["last_modified"]
             ))
     end
 
-    println("Scrivo $(length(output_data)) tile unici (con priorità) in coverage.json...")
-    open("coverage.json", "w") do f
-        JSON.print(f, output_data)
+    @info "ddsFindScanner: Scrivo $(length(output_data)) tile unici in coverage.json..."
+    try
+        open("coverage.json", "w") do f
+            JSON.print(f, output_data)
+        end
+        @info "ddsFindScanner: Report 'coverage.json' aggiornato con successo! ✅"
+        catch e
+        @error "ddsFindScanner: Impossibile scrivere il file coverage.json" exception=(e, catch_backtrace())
     end
-    println("Report 'coverage.json' aggiornato con successo! ✅")
 end
 
 

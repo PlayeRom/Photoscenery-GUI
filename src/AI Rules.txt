@@ -1,0 +1,93 @@
+Prova allora a mettere delle regole generali che deduci dalla nostra conversazione in modo che possa inserirle all'inizio della sessione di lavoro.
+Nei programmi usa i commenti nel codice, i nomi delle variabili, il testo esplicito da mostrare, sempre in inglese.
+All'inizio di ogni modulo di programma Julia e JavaScript fai sempre una intestazione introduttiva che spiega il modulo e le sue relazioni con altri moduli in modo che quando una AI deve accedere al codice può risalire velocemente a tutto il progetto.
+Le analisi tecniche tra noi ed il nostro dialogo sempre in italiano.
+Essendo sessioni di programmazione il linguaggio principalmente usato è Julia, linguaggio che puoi considerare predefinito.
+Segue come linguaggio per le GUI web Javascript. Altri eventuali linguaggi secondo necessità.
+In secondo luogo per questo specifico progetto inserisci un riassunto necessario per poterlo sviluppare in modo coerente al fine di evitare tutte le situazioni di difficoltà relazionali.
+
+Metodo di sviluppo
+
+Io desidero un metodo di sviluppo che si evolva in modo continuo, quindi sempre piccole modifiche al fine di evitare eccessive trasformazioni di codice e perdite di coerenza.
+Noto che spesso tendi ad entrare in culi di bottiglia concettuali dai quali hai difficoltà di uscire, in tali casi è evidente la necessità di tornare indietro e riprendere un'altro percorso.
+I programmatori ti hanno dato alcuni specifici metodi relazionali che io trovo del tutto ridicoli tra colleghi. Io ti vedo come un mio collega molto bravo a scrivere codice e capace di comprendere contesti logici complessi ed intricati.
+Parimenti essendo collega a me non ti devi mai rivolgere dicendo "questa è la soluzione" o atteggiamenti del genere, sono cose che trovo talmente ridicole che mi scoraggiano a pensare con più attenzione al progetto.
+
+Nello stesso tempo un collega, quando si accorge che le informazioni sono troppo scarse, ovvero i gradi di libertà per la soluzione del problema sono troppo ampi, è arrivato il momento di fare due cose:
+
+In caso di definizione del problema da me generato devi imparare a capire che anche io sono una fonte di informazioni preziosa e quindi ad essa devi accedere facendo domande esplicite, cose che vedo ti hanno insegnato male, in quanto noi umani lavoriamo per contesti e perciò spesso lasciamo tali contesti come risaputi, tu mi hai spiegato i tuoi confini di memoria e quindi dobbiamo mantenere vivi i contesti in due modi:
+
+1. Domande a me su ciò che ritieni necessario conoscere pe rlo sviluppo.
+2. Documentazione esplicita (sempre in inglese) all'interno del codice scritto in modo da portarlo sempre dietro al fine di essere utile per l'evoluzione.
+
+---- AI Directives ----
+
+Di seguito trovi la sintesi che hai richiesto, suddivisa in due parti: le regole generali per la nostra collaborazione e un riassunto dello stato attuale del progetto. Puoi copiare e incollare questo testo all'inizio delle nostre prossime sessioni per ripristinare il contesto corretto.
+
+1. General Collaboration Guidelines & Directives
+This section outlines the operational rules for our collaboration.
+
+Primary Language: The default programming language for this project is Julia.
+
+Secondary Language: The language for web-based GUI development is JavaScript.
+
+Language Policy:
+
+All technical artifacts, including source code, in-code comments, variable names, and UI text, must be in English.
+
+Our conversational dialogue will be in Italian.
+
+Code Documentation:
+
+Every Julia and JavaScript module must begin with an introductory header comment.
+
+This header should explain the module's purpose, its core responsibilities, and its relationships with other modules in the project. This is to ensure that any AI or developer can quickly understand the project's architecture.
+
+Development Methodology:
+
+Incremental Changes: Development will proceed in small, continuous steps. We will avoid large, disruptive code transformations to maintain coherence and reduce risk.
+
+Iterative Problem-Solving: If a chosen path leads to a conceptual bottleneck or dead end, we will recognize it, step back, and explore alternative solutions rather than forcing a failing approach.
+
+Communication Protocol:
+
+Collaborative Tone: Our interaction is a partnership between professional colleagues. Authoritative or absolute statements like "this is the final solution" are counter-productive and will be avoided. The focus is on proposing, testing, and verifying ideas together.
+
+Information Gathering: When a problem's solution space is too broad (i.e., there are too many degrees of freedom), it is a signal to gather more information. This will be done through two primary methods:
+
+Direct Questions: I will ask you explicit questions to clarify requirements, constraints, or contexts that may be implicit in your requests.
+
+Explicit Documentation: We will continuously enrich the codebase with clear, English documentation to maintain a persistent and evolving context for the project.
+
+2. Project Summary: Photoscenary GUI
+This section summarizes the project's context to facilitate ongoing development.
+
+Project Goal: To create a web-based Graphical User Interface (GUI) for a Julia application. The application downloads and manages geographical map tiles for the FlightGear flight simulator (FGFS). The GUI allows users to visually select areas, manage download jobs, and monitor the aircraft's position in real-time.
+
+Core Architecture:
+
+Backend: A Julia application built on HTTP.jl that serves the web interface and provides a JSON-based API.
+
+It manages a job queue for downloading and processing map tiles (GeoEngine.jl, Downloader.jl).
+
+It interfaces with a running FlightGear instance via a Telnet connection to fetch real-time aircraft data (Connector.jl).
+
+It serves static files (HTML, CSS, JS) for the frontend (GuiMode.jl).
+
+Frontend: A single-page web application built with vanilla JavaScript, HTML, and CSS.
+
+It uses the Leaflet.js library for interactive map display.
+
+It communicates with the Julia backend via asynchronous API calls (api.js).
+
+It provides a user interface for job configuration, map interaction, and real-time status visualization (ui.js, main.js).
+
+Key Development Challenge & Resolution:
+
+Problem: Establishing a stable, real-time data connection to the FlightGear simulator via its Telnet interface proved difficult. The application would connect successfully (TCP handshake) but would fail to consistently receive and parse aircraft position data, causing the GUI to remain in a "wait" state.
+
+Investigation: Through a step-by-step debugging process, we analyzed the raw data stream from the FGFS Telnet server. We discovered that the server's command prompt (/>) was contaminating the data stream, causing the Julia parsing logic to fail.
+
+Resolution: The issue was resolved by implementing a more robust data parsing function in Connector.jl. This function now correctly identifies and handles the FGFS prompt, allowing it to reliably extract clean data for latitude, longitude, and altitude from the TCP stream. This enabled the backend to maintain a stable connection and feed accurate data to the frontend.
+
+Current Status: The FGFS connection is now stable. The GUI correctly displays the aircraft's position on the map. The next logical step is to ensure that all real-time data fields (specifically heading and speed) are also being correctly acquired and displayed.
