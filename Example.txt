@@ -52,6 +52,11 @@ julia --project=. -t4 -e '
 
 Versione interattiva web in JS
 
-julia --project=. -e 'using Photoscenary; Photoscenary.run_cli(["--http"])'
+julia --project=. -e 'using Photoscenary; Photoscenary.GuiMode.run(["--http"])'
 
 julia --project=. -e 'using Photoscenary; Photoscenary.GuiMode.run(["--http=8000"])'
+
+
+If you want to specify one of the four map servers, you can select it using the --map n command. This command can assume the following values: 1, 2, 3, or 4. For example, the US is --map 2.
+
+julia --project=. -e 'using Photoscenary; Photoscenary.GuiMode.run(["--http --map 2"])'
