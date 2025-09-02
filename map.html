@@ -300,6 +300,25 @@
             margin:0;
         }
 
+        .btn-working {
+            background-color: #ffebee; /* Un rosso molto chiaro come base */
+            color: #b71c1c; /* Testo rosso scuro per contrasto */
+            cursor: not-allowed; /* Cursore che indica che non è cliccabile */
+            animation: pulse-red 2s infinite; /* Applica l'animazione */
+        }
+
+        @keyframes pulse-red {
+            0% {
+                background-color: #ffebee; /* Rosso chiaro */
+            }
+            50% {
+                background-color: #ffffff; /* Bianco */
+            }
+            100% {
+                background-color: #ffebee; /* Torna al rosso chiaro */
+            }
+        }
+
         /* annulla margini verticali standard di label/select in quel blocco */
         .sdwn-inline label, .sdwn-inline select { margin-top:0; margin-bottom:0; }
 
@@ -389,6 +408,8 @@
 
         <!-- Main action button -->
         <button id="btn-download-around-aircraft">Download around aircraft</button>
+
+        <button id="btn-fill-holes" title="Scans the visible area and downloads missing tiles to patch the scenery">Patch Scenery</button>
 
         <div class="control-group" style="margin-top: 10px;">
             <input type="text" id="queue-info" value="Download flow info here..."

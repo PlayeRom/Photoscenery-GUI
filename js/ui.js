@@ -32,6 +32,7 @@ const elements = {
     downloadBtn: document.getElementById('downloadBtn'),
     opacitySlider: document.getElementById('opacity-slider'),
     btnDownloadAroundAircraft: document.getElementById('btn-download-around-aircraft'),
+    btnFillHoles: document.getElementById('btn-fill-holes'),
     dateFilterSlider: document.getElementById('date-filter-slider'),
     dateFilterLabel: document.getElementById('date-filter-label')
 };

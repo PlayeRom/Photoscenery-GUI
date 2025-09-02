@@ -106,18 +106,26 @@ function monitor_and_assemble(root_path::String, save_path::String, tmp_dir::Str
             push!(claimed, key_claim)  # CLAIM
             @info "🧩 [MONITOR] Assemble TRY" tile_id=g.tile_id size_id=g.size_id total=g.total_chunks
             try
-                ok = TileProcessor.assemble_group_from_tmp(g.tile_id, g.size_id, g.total_chunks, present,
-                                                            root_path, save_path, tmp_dir, cfg)
+                # Chiama la funzione che ora fa tutto: assembla, converte E posiziona il tile.
+                # Riceve solo un booleano di successo in cambio.
+                ok = TileProcessor.assemble_group_from_tmp(
+                    g.tile_id, g.size_id, g.total_chunks, present,
+                    root_path, save_path, tmp_dir, cfg
+                    )
+
                 if ok
+                    # Se tutto è andato a buon fine, marchiamo il tile come "visto".
                     push!(seen, key_seen)
-                    @info "✅ [MONITOR] Assemble OK" tile_id=g.tile_id size_id=g.size_id
+                    @info "✅ [MONITOR] Assemble & Placement OK" tile_id=g.tile_id size_id=g.size_id
                 else
-                    @warn "⚠️ [MONITOR] Assemble returned false; will retry later" tile_id=g.tile_id size_id=g.size_id
+                    # Se la funzione ha restituito false, c'è stato un problema durante l'assemblaggio o il posizionamento.
+                    @warn "⚠️ [MONITOR] Assemble or Placement FAILED, will retry later" tile_id=g.tile_id
                 end
                 catch e
-                @error "💥 [MONITOR] Exception assembling" tile_id=g.tile_id size_id=g.size_id exception=(e,catch_backtrace())
+                @error "💥 [MONITOR] Exception in Assemble/Place" tile_id=g.tile_id exception=(e,catch_backtrace())
             finally
-                delete!(claimed, key_claim)  # RELEASE
+                # Rilascia sempre il "claim" per permettere tentativi futuri.
+                delete!(claimed, key_claim)
             end
         end
 

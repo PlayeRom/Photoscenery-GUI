@@ -5,7 +5,7 @@ using ..Commons, ..StatusMonitor, Images, Downloads, Printf, LightXML, ..JobFact
 using Base.Threads: @spawn
 using FileIO, PNGFiles
 
-export MapServer, populate_queue!, start_chunk_downloads_parallel!, enqueue_chunk_jobs
+export MapServer, populate_queue!, start_chunk_downloads_parallel!, enqueue_chunk_jobs!, enqueue_high!, enqueue_low!
 
 
 """
@@ -36,6 +36,32 @@ const FALLBACK_QUEUE = Channel{Tuple{Int, Int}}(50) # Canale per (tile_id, size_
 const JOBS_DONE_COUNTER = Threads.Atomic{Int}(0)
 const FAILED_JOBS_COUNT = Threads.Atomic{Int}(0)
 const PENDING_JOBS = Threads.Atomic{Int}(0)
+
+# --- PRIORITÀ ---
+const CHUNK_Q_HIGH = Channel{Commons.ChunkJob}(512)
+const CHUNK_Q_LOW  = Channel{Commons.ChunkJob}(4096)
+
+# Mappa (temp_path → :high | :low) per reinserire i retry nella stessa classe
+const JOB_CLASS = Dict{String,Symbol}()
+const JOB_CLASS_LOCK = ReentrantLock()
+
+
+# Helper di enqueue (riusano la tua enqueue_chunk_jobs! per contatori/log)
+enqueue_high!(jobs::Vector{Commons.ChunkJob}) = begin
+    lock(JOB_CLASS_LOCK) do
+        for j in jobs; JOB_CLASS[j.temp_path] = :high; end
+    end
+    enqueue_chunk_jobs!(CHUNK_Q_HIGH, jobs)
+end
+
+
+enqueue_low!(jobs::Vector{Commons.ChunkJob}) = begin
+    lock(JOB_CLASS_LOCK) do
+        for j in jobs; JOB_CLASS[j.temp_path] = :low; end
+    end
+    enqueue_chunk_jobs!(CHUNK_Q_LOW, jobs)
+end
+
 
 struct MapServer
     id::Int64
@@ -78,8 +104,8 @@ function _getMapServerURL(m::MapServer, bbox, pixel_size)
     urlCmd = _getMapServerReplace(urlCmd, "{lonLL}", bbox.lonLL)
     urlCmd = _getMapServerReplace(urlCmd, "{latUR}", bbox.latUR)
     urlCmd = _getMapServerReplace(urlCmd, "{lonUR}", bbox.lonUR)
-    urlCmd = _getMapServerReplace(urlCmd, "{szWidth}", pixel_size.width)
-    urlCmd = _getMapServerReplace(urlCmd, "{szHight}", pixel_size.height)
+    urlCmd = _getMapServerReplace(urlCmd, "{szWidth}", Int(pixel_size.width))
+    urlCmd = _getMapServerReplace(urlCmd, "{szHight}", Int(pixel_size.height))
     return m.webUrlBase * urlCmd, 0
 end
 
@@ -148,9 +174,10 @@ function download_and_validate_png(url::String, dest_path::String; headers::Dict
                 FileIO.load(temp_path)
                 mv(temp_path, dest_path, force=true)
                 @info "Downloader.download_and_validate_png: write image $(dest_path)"
-                catch e
+            catch e
                 ispath(temp_path) && rm(temp_path, force=true)
                 rethrow(ErrorException("Downloader.download_and_validate_png: Scrittura su disco fallita: $e"))
+                FileIO.load(temp_path)
             end
 
             return filesize(dest_path)
@@ -180,27 +207,98 @@ function download_and_validate_png(url::String, dest_path::String; headers::Dict
 end
 
 
+"""
+_restore_best_cached_tile(tile_id::Int, requested_size_id::Int, root_path::String, save_path::String, cfg::Dict; allow_higher::Bool=true)
+
+Esplora tutte le possibili risoluzioni per `tile_id` sia nella directory di output (`root_path`) sia in quella di cache/salvataggio (`save_path`).
+Restituisce la `size_id` del tile ripristinato (o già presente) più vicina a `requested_size_id` (stessa → più vicina sotto → eventualmente sopra),
+oppure `nothing` se non ha trovato nulla.
+
+Regole:
+- Preferisce **DDS** a **PNG** se entrambi presenti.
+- Ordine ricerca per distanza: [requested, requested-1, requested+1, requested-2, requested+2, ...]
+(l’“above” è incluso solo se `allow_higher=true`).
+- Se il file è in `save_path`, lo **copia** in `root_path` mantenendo il nome file.
+"""
+function _restore_best_cached_tile(tile_id::Int, requested_size_id::Int,
+                                   root_path::String, save_path::String, cfg::Dict;
+                                   allow_higher::Bool=true)
+    # range tipico: 0..6 (puoi alzarlo in cfg con "max_size_id")
+    max_id = get(cfg, "max_size_id", 6)
+    min_id = 0
+
+    # helper: esiste già un file (dds/png) per questo tile in output?
+    _has_in_output = function (sid::Int)
+        width, _ = Commons.getSizeAndCols(sid)
+        dest_dir  = Commons.tile_dest_dir(tile_id, width, root_path)
+        if !isdir(dest_dir); return false; end
+        files = readdir(dest_dir)
+        any(endswith.(lowercase.(files), ".dds")) || any(endswith.(lowercase.(files), ".png"))
+    end
+
+    # Ordine candidati per "distanza" dalla richiesta
+    candidates = Int[]
+    max_d = max(requested_size_id - min_id, max_id - requested_size_id)
+    for d in 0:max_d
+        s1 = requested_size_id - d
+        s2 = requested_size_id + d
+        if d == 0
+            (s1 >= min_id && s1 <= max_id) && push!(candidates, s1)
+        else
+            (s1 >= min_id) && push!(candidates, s1)
+            (allow_higher && s2 <= max_id) && push!(candidates, s2)
+        end
+    end
+
+    # 1) Se è già presente in output, basta così
+    for sid in candidates
+        if _has_in_output(sid)
+            @info "Restore(move): found existing tile $tile_id at size $sid in output"
+            return sid
+        end
+    end
+
+    # 2) Prova a spostare dalla cache con la funzione ufficiale
+    for sid in candidates
+        status = ddsFindScanner.moveImage(root_path, save_path, tile_id, sid, cfg)
+        # convenzione: "moved" = spostato, "skip" = già presente/nessuna azione
+        if status in ("moved", "skip")
+            @info "Restore(move): tile $tile_id satisfied by cached size=$sid (status=$status)"
+            return sid
+        end
+    end
+
+    return nothing
+end
+
+
 function download_worker(worker_id::Int, map_server::MapServer, cfg::Dict)
-    @show CHUNK_QUEUE
-    @info "Download.download_worker: ✅ Started worker id: $download_worker"
+    @info "Downloader: ✅ Started priority worker id=$worker_id"
     start_time = time()
     downloaded_bytes = 0
-    for job in CHUNK_QUEUE
+
+    while true
+        # Priorità: serviamo prima l'alta priorità se presente
+        job = if isready(CHUNK_Q_HIGH)
+            take!(CHUNK_Q_HIGH)
+        else
+            take!(CHUNK_Q_LOW)    # blocca qui se entrambe vuote
+        end
+
         job === :stop && break
 
-        # Controlla se il file è già stato scaricato correttamente
-        if isfile(job.temp_path) && filesize(job.temp_path) > 1024
+        # Se esiste già un file valido per questo chunk, evita lavoro inutile
+        if isfile(job.temp_path) && filesize(job.temp_path) > get(cfg, "min_chunk_bytes", 64)
             try
-                # Validazione rapida del file esistente
                 if validate_png_file(job.temp_path)
                     bytes = filesize(job.temp_path)
                     StatusMonitor.update_chunk_state(job.tile_id, job.chunk_xy, :completed, bytes)
                     Threads.atomic_add!(JOBS_DONE_COUNTER, 1)
                     Threads.atomic_add!(PENDING_JOBS, -1)
-                    continue  # Passa al prossimo job
+                    continue
                 end
-            catch e
-                @warn "Download.download_worker: file validation failed, re-downloading: $(job.temp_path)"
+                catch e
+                @warn "Downloader: file validation failed, re-downloading: $(job.temp_path)"
                 rm(job.temp_path, force=true)
             end
         end
@@ -208,76 +306,103 @@ function download_worker(worker_id::Int, map_server::MapServer, cfg::Dict)
         StatusMonitor.update_chunk_state(job.tile_id, job.chunk_xy, :in_progress)
         url, err = _getMapServerURL(map_server, job.bbox, job.pixel_size)
 
+        # Errore URL → prova retry con backoff, poi fallback
         if err != 0
-            @warn "Download.download_worker: Worker $worker_id: URL generation FAILED for chunk $(job.tile_id)-$(job.chunk_xy)."
-            local error_message::String
-            if err isa Downloads.RequestError
-                # Se è un errore di rete, estraiamo solo il messaggio
-                error_message = "Errore di Rete: $(err.message)"
+            @warn "Downloader: URL generation FAILED for $(job.tile_id)-$(job.chunk_xy); will retry"
+            if job.retries_left > 0
+                attempts   = get(cfg, "attempts", get(cfg, "attemps", 5))
+                idx        = max(0, attempts - job.retries_left)
+                base_sleep = get(cfg, "retry_backoff_base", 1.7)
+                cap_sleep  = get(cfg, "retry_max_sleep", 20.0)
+                sleep(min(cap_sleep, base_sleep^idx))
+
+                new_job = Commons.ChunkJob(job.tile_id, job.size_id, job.chunk_xy, job.bbox, job.pixel_size, job.temp_path, job.retries_left - 1)
+                local cls::Symbol
+                lock(JOB_CLASS_LOCK) do
+                    cls = get(JOB_CLASS, job.temp_path, :high)
+                    JOB_CLASS[new_job.temp_path] = cls
+                end
+                (cls === :high ? put!(CHUNK_Q_HIGH, new_job) : put!(CHUNK_Q_LOW, new_job))
             else
-                # Per qualsiasi altro errore, indichiamo il tipo
-                error_message = "Errore Inatteso: $(typeof(err))"
+                @warn "Downloader: URL generation permanent failure → fallback"
+                put!(FALLBACK_QUEUE, (job.tile_id, job.size_id))
+                StatusMonitor.update_chunk_state(job.tile_id, job.chunk_xy, :failed)
+                Threads.atomic_add!(FAILED_JOBS_COUNT, 1)
+                Threads.atomic_add!(PENDING_JOBS, -1)
             end
-            # Logghiamo SOLO la nostra stringa personalizzata, senza l'oggetto "exception"
-            @warn "Worker $worker_id: Download fallito. Causa: $error_message"
-            Threads.atomic_add!(FAILED_JOBS_COUNT, 1)
-            Threads.atomic_add!(JOBS_DONE_COUNTER, 1)
-            Threads.atomic_add!(PENDING_JOBS, -1)
             continue
         end
 
+        # Parametri retry/timeout progressivi
+        attempts   = get(cfg, "attempts", get(cfg, "attemps", 5))      # tentativi totali per chunk (incl. il 1°)
+        base_to    = Float64(get(cfg, "timeout", 90))                   # timeout base al 1° tentativo
+        idx        = max(0, attempts - job.retries_left)                # 0,1,2,...
+        grow       = get(cfg, "retry_timeout_factor", 1.6)              # fattore crescita timeout
+        cap_to     = Float64(get(cfg, "retry_timeout_cap", 300))        # tetto massimo
+        timeout_sec = min(cap_to, base_to * (grow^idx))
+
+        headers = Dict("User-Agent" => "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/104.0.0.0 Safari/537.36")
+
         try
-            timeout_sec = get(cfg, "timeout", 90)
-            headers = Dict("User-Agent" => "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/104.0.0.0 Safari/537.36")
-            bytes = download_and_validate_png(url, job.temp_path; headers=headers, timeout=Float64(timeout_sec) ,max_redirects=5)
+            bytes = download_and_validate_png(url, job.temp_path; headers=headers, timeout=Float64(timeout_sec))
             StatusMonitor.update_chunk_state(job.tile_id, job.chunk_xy, :completed, bytes)
             Threads.atomic_add!(JOBS_DONE_COUNTER, 1)
+            Threads.atomic_add!(PENDING_JOBS, -1)
             downloaded_bytes += bytes
-        catch e
-            # Controlliamo se l'errore è un HTTP 500 del server
-            if e isa Downloads.RequestError && (e.response.status == 500 || occursin("Operation too slow", string(e)))
-                # CASO 1: Errore del server (es. mare, nessuna immagine).
-                @warn "Downloader: Server error on chunk $(job.tile_id)-$(job.chunk_xy). Triggering fallback."
-                # Metti il tile fallito nella coda di fallback per un nuovo tentativo
-                # a risoluzione inferiore.
+
+            catch e
+            st = try e.response.status catch; 0 end
+
+            # Fallback SOLO per errori definitivi (contenuto/server)
+            if e isa Downloads.RequestError && (st in (404, 410, 500))
+                @warn "Downloader: definitive server/content error ($st) on $(job.tile_id)-$(job.chunk_xy) → fallback"
                 put!(FALLBACK_QUEUE, (job.tile_id, job.size_id))
-                # Segna comunque il lavoro corrente come "fatto" per non bloccare i contatori.
                 StatusMonitor.update_chunk_state(job.tile_id, job.chunk_xy, :failed)
-                ##Threads.atomic_add!(Downloader.JOBS_DONE_COUNTER, 1)
+                Threads.atomic_add!(FAILED_JOBS_COUNT, 1)
+                Threads.atomic_add!(PENDING_JOBS, -1)
+
             else
-                # CASO 2: Per tutti gli altri errori (es. timeout di rete),
-                # manteniamo la logica dei tentativi.
-                @warn "Downloader: Worker $worker_id failed chunk $(job.tile_id)-$(job.chunk_xy)" exception=(e, catch_backtrace())
+                # Transienti: timeout/lentezza/429/503/504 ecc. → RETRY
+                @warn "Downloader: transient error ($st) on $(job.tile_id)-$(job.chunk_xy); will retry" exception=(e, catch_backtrace())
                 isfile(job.temp_path) && rm(job.temp_path, force=true)
+
                 if job.retries_left > 0
-                    @info "Downloader: Retrying chunk $(job.tile_id)-$(job.chunk_xy) ($(job.retries_left - 1) retries left)"
+                    base_sleep = get(cfg, "retry_backoff_base", 1.7)
+                    cap_sleep  = get(cfg, "retry_max_sleep", 20.0)
+                    sleep(min(cap_sleep, base_sleep^idx))
+
                     new_job = Commons.ChunkJob(
                         job.tile_id, job.size_id, job.chunk_xy,
                         job.bbox, job.pixel_size, job.temp_path,
                         job.retries_left - 1
-                    )
-                    put!(Downloader.CHUNK_QUEUE, new_job)
-                    ## Threads.atomic_add!(Downloader.PENDING_JOBS, 1)
+                        )
+                    # reinserisci nella stessa classe (HIGH/LOW) del job originale
+                    local cls::Symbol
+                    lock(JOB_CLASS_LOCK) do
+                        cls = get(JOB_CLASS, job.temp_path, :high)
+                        JOB_CLASS[new_job.temp_path] = cls
+                    end
+                    if cls === :high
+                        put!(CHUNK_Q_HIGH, new_job)
+                    else
+                        put!(CHUNK_Q_LOW, new_job)
+                    end
                 else
-                    # Anche dopo N tentativi falliti, trattiamo il problema come un
-                    # segnale per tentare una risoluzione più bassa.
-                    @warn "Downloader: Permanent failure for chunk $(job.tile_id)-$(job.chunk_xy) after all retries. Triggering fallback."
-                    # Metti il tile fallito nella coda di fallback
-                    put!(FALLBACK_QUEUE, (job.tile_id, job.size_id))
-                    # Aggiorna i contatori
-                    StatusMonitor.update_chunk_state(job.tile_id, job.chunk_xy, :failed)
-                    ##Threads.atomic_add!(Downloader.JOBS_DONE_COUNTER, 1)
+                    @warn "Downloader: retries exhausted for $(job.tile_id)-$(job.chunk_xy) → fallback"
+                        put!(FALLBACK_QUEUE, (job.tile_id, job.size_id))
+                        StatusMonitor.update_chunk_state(job.tile_id, job.chunk_xy, :failed)
+                        Threads.atomic_add!(FAILED_JOBS_COUNT, 1)
+                        Threads.atomic_add!(PENDING_JOBS, -1)
                 end
             end
-        finally
-            @info "Worker $worker_id end of job."
-            Threads.atomic_add!(PENDING_JOBS, -1)  # Job completato
         end
-        elapsed = time() - start_time
-        speed_MBps = downloaded_bytes / 1_048_576 / elapsed
-        @info "Worker $worker_id finished. Time: $(round(elapsed, digits=2)) s, Downloaded: $(round(downloaded_bytes / 1_048_576, digits=2)) MB, Speed: $(round(speed_MBps, digits=2)) MB/s"
     end
+
+    elapsed = time() - start_time
+    mb = downloaded_bytes / 1024^2
+    @info "Worker $worker_id finished. Time: $(round(elapsed, digits=1))s, Downloaded: $(round(mb, digits=2)) MiB."
 end
+
 
 
 """
@@ -293,27 +418,19 @@ function fallback_manager(map_server::MapServer, cfg::Dict, root_path::String, s
     processed_fallbacks = Set{Tuple{Int, Int}}()
 
     for (tile_id, failed_size_id) in FALLBACK_QUEUE
+        # Evita di processare lo stesso fallback più volte
         if (tile_id, failed_size_id) in processed_fallbacks
             continue
         end
         push!(processed_fallbacks, (tile_id, failed_size_id))
 
-        new_size_id = failed_size_id - 1
-        if new_size_id < 0
-            @warn "Fallback: Tile $tile_id failed at lowest resolution. Giving up."
-            continue
-        end
+        @info "Fallback: Ricevuto tile fallito $tile_id (size $failed_size_id). Avvio procedura di recupero."
 
-        @info "Fallback: Processing tile $tile_id. Attempting fallback to resolution $new_size_id."
-
-        # --- LOGICA CHIAVE AGGIUNTA ---
-        # 1. Prova a recuperare il tile a risoluzione inferiore dalla cache prima di riscaricarlo.
-        #    Sfruttiamo la stessa funzione usata da GeoEngine.
-        status = ddsFindScanner.moveImage(root_path, save_path, tile_id, new_size_id, cfg)
-        if status in ("moved", "skip")
-            @info "Fallback: SUCCESS! Tile $tile_id (res: $new_size_id) was found in cache and moved."
-            # Il tile è stato recuperato, il nostro lavoro qui è finito per questo fallback.
-            # Puliamo comunque i vecchi chunk falliti.
+        # 1. Tenta prima di tutto di ripristinare da cache (qualsiasi risoluzione valida)
+        restored_sid = _restore_best_cached_tile(tile_id, failed_size_id, root_path, save_path, cfg)
+        if restored_sid !== nothing
+            @info "Fallback: SUCCESS! Tile $tile_id recuperato dalla cache con size $restored_sid."
+            # Pulisci i chunk temporanei del tentativo fallito
             try
                 for f in readdir(tmp_dir)
                     if startswith(f, "$(tile_id)_$(failed_size_id)_")
@@ -321,49 +438,48 @@ function fallback_manager(map_server::MapServer, cfg::Dict, root_path::String, s
                     end
                 end
             catch e
-                @warn "Fallback: Could not clean up old chunks for tile $tile_id." exception=(e, catch_backtrace())
+                @warn "Fallback: Errore durante la pulizia dei chunk per $tile_id" exception=(e, catch_backtrace())
             end
-            continue # Passa al prossimo tile fallito
+            continue # Lavoro finito per questo tile, passa al prossimo
         end
-        # --- FINE LOGICA AGGIUNTA ---
 
-        @info "Fallback: Tile $tile_id (res: $new_size_id) not found in cache. Proceeding to download."
+        # 2. Se il ripristino da cache fallisce, procedi con il download a risoluzione inferiore
+        new_size_id = failed_size_id - 1
+        if new_size_id < 0
+            @warn "Fallback: Tile $tile_id fallito anche alla risoluzione minima. Abbandono."
+            continue
+        end
 
-        # 2. Se non è stato trovato nella cache, procedi con la logica di download esistente.
-        #    Pulizia dei chunk parziali esistenti per il tile fallito
+        @info "Fallback: Cache non disponibile per tile $tile_id. Tento il re-download a size $new_size_id."
+
+        # 3. Pulisci i chunk vecchi prima di crearne di nuovi
         try
             for f in readdir(tmp_dir)
                 if startswith(f, "$(tile_id)_$(failed_size_id)_")
                     rm(joinpath(tmp_dir, f), force=true)
                 end
             end
-            @info "Fallback: Cleaned up old chunks for tile $tile_id at size $failed_size_id."
         catch e
-            @warn "Fallback: Could not clean up chunks for tile $tile_id." exception=(e, catch_backtrace())
+            @warn "Fallback: Errore durante la pulizia dei chunk per $tile_id" exception=(e, catch_backtrace())
         end
 
-        # 3. Genera un nuovo set di ChunkJob alla risoluzione inferiore
+        # 4. Genera e accoda i nuovi job a risoluzione ridotta
         try
-            # NOTA: Per fare questo, la funzione `create_chunk_jobs` di JobFactory
-            # deve essere accessibile qui, e lo è grazie a `using ..JobFactory`.
-
-            # Crea un oggetto TileMetadata temporaneo per generare i nuovi chunk
             _, _, lon_base, lat_base, lon_step, lat_step, _, _ = Commons.coordFromIndex(tile_id)
             width, cols = Commons.getSizeAndCols(new_size_id)
             fallback_tile = Commons.TileMetadata(
                 tile_id, new_size_id,
                 lon_base, lat_base, lon_base + lon_step, lat_base + lat_step,
                 0, 0, 0.0, 0.0, lon_step, width, cols
-            )
-
+                )
             new_jobs = create_chunk_jobs([fallback_tile], cfg, tmp_dir)
 
             if !isempty(new_jobs)
-                @info "Fallback: Re-enqueueing $(length(new_jobs)) new chunk(s) for tile $tile_id at size $new_size_id."
-                enqueue_chunk_jobs!(CHUNK_QUEUE, new_jobs)
+                @info "Fallback: Accodamento di $(length(new_jobs)) nuovi chunk per tile $tile_id a size $new_size_id."
+                enqueue_low!(new_jobs)
             end
         catch e
-            @error "Fallback: Failed to generate new chunk jobs for tile $tile_id." exception=(e, catch_backtrace())
+            @error "Fallback: Impossibile generare nuovi chunk job per $tile_id." exception=(e, catch_backtrace())
         end
     end
 end
@@ -416,7 +532,6 @@ function start_chunk_downloads_parallel!(nworkers::Int, map_server::MapServer, c
     for i in 1:nworkers
         @async download_worker(i, map_server, cfg)
     end
-    # Avvia il manager per i fallback con i percorsi aggiuntivi
     @async fallback_manager(map_server, cfg, root_path, save_path, tmp_dir)
     @info "✅ Downloader: Started $nworkers download workers and 1 fallback manager."
 end

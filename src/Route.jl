@@ -82,6 +82,7 @@ function findFileOfRoute(fileName::String, idTypeOfFile::Int=0)
     end
 end
 
+
 """
 selectIcao(icaoToSelect, centralPointRadiusDistance)
 
@@ -177,6 +178,7 @@ function selectIcao(icaoToSelect, centralPointRadiusDistance)
     return centralPointLat, centralPointLon, errorCode
 end
 
+
 """
 getRouteListFormatFGFS!(routeList, route, minDistance)
 
@@ -231,6 +233,7 @@ function getRouteListFormatFGFS!(routeList,route,minDistance)
     end
     return routeList
 end
+
 
 """
 getRouteListFormatGPX!(routeList, route, minDistance)
@@ -290,6 +293,7 @@ function getRouteListFormatGPX!(routeList, route, minDistance)
     end
     return routeList
 end
+
 
 """
 loadRoute(fileOfRoute, centralPointRadiusDistance) -> (routeList, pointCount)

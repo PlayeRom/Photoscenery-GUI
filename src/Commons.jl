@@ -85,7 +85,7 @@ function adaptive_size_id(k_max::Int, h::Real, d::Real, fov_deg::Real=60)::Int
     TILE_LAT_DEG = 1 / 8        # tile height in degrees
     EARTH_RADIUS_M = 6371000.0  # mean Earth radius in meters
     SCREEN_PX = 1920            # assumed display width in pixels
-    KFOV = 2.0                  # Potenzia l'effetto quota sulla distanza
+    KFOV = 1.0                  # Potenzia l'effetto quota sulla distanza
 
     # --- 1. Convert altitude (feet) and distance (NM) to meters ---
     alt_m   = h * FT_TO_M

@@ -75,7 +75,7 @@ function assemble_group_from_tmp(
 
     # 2) misura dal primo file esistente (evita race)
     first_path = first(values(byyx))
-    if !(isfile(first_path) && filesize(first_path) >= get(cfg, "min_chunk_bytes", 1024))
+    if !(isfile(first_path) && filesize(first_path) >= get(cfg, "min_chunk_bytes", 64))
         return false
     end
 

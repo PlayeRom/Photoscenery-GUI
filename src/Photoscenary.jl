@@ -50,8 +50,9 @@ include("AssemblyMonitor.jl")   # Dipende da Commons
 
 # 3. Moduli Principali (usano i moduli di utilità)
 include("GeoEngine.jl")         # Dipende da molti moduli, va caricato dopo di essi
-# 4. Moduli di alto livello (interfaccia e configurazione)
+using .GeoEngine                # <-- Rende 'GeoEngine' visibile ai file inclusi dopo
 
+# 4. Moduli di alto livello (interfaccia e configurazione)
 include("AppConfig.jl")
 
 include("BatchMode.jl")
@@ -64,6 +65,7 @@ using .dds2pngDXT1
 # -----------------------------------------------------------------------------
 
 export BatchMode, GuiMode
+export GeoEngine
 
 end # module Photoscenary
 

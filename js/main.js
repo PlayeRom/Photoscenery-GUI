@@ -16,7 +16,7 @@ import {
     setupInteractiveSelection,
     updateHandleStyles,
     linkRadiusHandleToInput,
-    updateFgfsIndicator
+    updateFgfsIndicator,
 } from './ui.js';
 
 // ---------- DEBUG SWITCH ----------
@@ -25,7 +25,8 @@ const log = (...a) => window.DEBUG_FGFS && console.log('[DEBUG-JS]', ...a);
 
 // --- Aircraft-auto-queue settings ---
 const RADIUS_AROUND_AC = 20;   // NM of each circle
-const OVERLAP_FACTOR   = 2/3;  // ⅔ diameter offset
+const OVERLAP_FACTOR   = 0.4;  // ⅔ diameter offset
+const MIN_JOB_INTERVAL_MS = 3000; // anti-flood throttle
 
 const DATE_FILTER_LABELS = ["This Session", "Today", "Yesterday", "Last Week", "Last Month", "Last Year", "All Time"];
 
@@ -44,7 +45,11 @@ const state = {
     lastDaaCircleId: null,          // ID dell'ultimo cerchio DAA creato
     lastDaaOriginPoint: null,       // Posizione dell'aereo all'ultimo trigger DAA
     sessionStartTime: null,         // Aggiungi: Ora di avvio della sessione
-    dateFilterIndex: 6              // Aggiungi: Indice del filtro (default: 6 = All Time)
+    dateFilterIndex: 6,             // Aggiungi: Indice del filtro (default: 6 = All Time)
+    lastDaaCenterPoint: null,       // centro dell’ultimo cerchio verde
+    lastAutoLaunchTs: 0,            // timestamp ultimo invio autoù
+    lastDaaCircleLayer: null,       // riferimento diretto all’ultimo cerchio verde
+    daaArmed: false                 // isteresi: diventa true solo dopo essere entrati sotto ARM_TH
 };
 
 const activeCircles = {};           // Stores active job circles on the map
@@ -130,6 +135,8 @@ function drawCircle(jobId, lat, lon, radiusKm) {
     }).addTo(elements.map);
 
     activeCircles[jobId] = circle;
+    state.lastDaaCenterPoint = circle.getLatLng();
+    state.lastDaaCircleLayer = circle;
 }
 
 /**
@@ -174,7 +181,6 @@ function updateFollowAircraftAvailability() {
 
     if (!btnFollow || !sdwnSelect) return;
 
-    // (volendo più robusto)
     state.followAircraftAllowed = state.isConnected && Number.isFinite(state.currentHeading);
     btnFollow.disabled = !state.followAircraftAllowed;
 
@@ -186,11 +192,6 @@ function updateFollowAircraftAvailability() {
         btnFollow.style.backgroundColor = "";
         btnFollow.style.color = "";
         sdwnSelect.disabled = false;
-    }
-
-    if (!state.followAircraftAllowed && state.followAircraftActive) {
-        state.followAircraftActive = false;
-        updateFollowAircraftAvailability();
     }
 }
 
@@ -321,6 +322,8 @@ function destinationPoint(lat, lon, dNm, bearingDeg) {
  * 5. It draws a green, confirmed circle and immediately starts the download.
  */
 function startAutomaticFollowJob() {
+    state.isAutoJobPending = true;
+
     // 1. Get real-time aircraft data
     api.getFgfsStatus().then(data => {
         if (!data.active) {
@@ -330,52 +333,50 @@ function startAutomaticFollowJob() {
             return;
         }
 
-        // Memorizza la posizione dell'aereo
-        // Questo punto diventa il nostro riferimento per la prossima misurazione.
         state.lastDaaOriginPoint = L.latLng(data.lat, data.lon);
-        // 2. Read parameters from GUI, overriding where necessary
-        const radiusNm = parseFloat(elements.radiusInput.value) || 20;
-        const aheadPoint = destinationPoint(data.lat, data.lon, radiusNm / 2, data.heading);
+
+        const radiusNm  = parseFloat(elements.radiusInput.value) || 20;
+        const ahead = destinationPoint(data.lat, data.lon, radiusNm * OVERLAP_FACTOR, data.heading);
 
         const jobParams = {
-            lat: aheadPoint.lat,
-            lon: aheadPoint.lon,
+            lat: ahead.lat,
+            lon: ahead.lon,
             radius: radiusNm,
-            over: 2, // Forza sempre la sovrascrittura
-            // Invia il valore di "Resolution" come 'size'.
-            // Questo diventerà 'k_max' per la funzione adaptive_size_id nel backend.
+            over: 2,
             size: parseInt(elements.sizeInput.value, 10) || 4,
-            sdwn: parseInt(elements.sdwnSelect.value, 10) || 0,
-            mode: 'daa'
+                             sdwn: parseInt(elements.sdwnSelect.value, 10) || 0,
+                             mode: 'daa'
         };
 
-        // 3. Draw the circle directly in its "active job" (green) state
-        const circle = L.circle([aheadPoint.lat, aheadPoint.lon], {
-            radius: radiusNm * 1852, // Convert NM to meters for Leaflet
-            color: '#00cc00',        // Green for active job
+        const circle = L.circle([ahead.lat, ahead.lon], {
+            radius: radiusNm * 1852,
+            color: '#00cc00',
             fillColor: '#00cc00',
             fillOpacity: 0.15,
             weight: 1.5
         }).addTo(elements.map);
 
-        // 4. Start the job immediately with the correct parameters
-        api.startJob(jobParams)
-        .then(jobData => {
+        // SALVA il centro del cerchio corrente per il prossimo trigger
+        state.lastDaaCenterPoint = circle.getLatLng();
+        state.daaArmed = false;  // all’inizio NON siamo armati: prima bisogna avvicinarsi
+
+        return api.startJob(jobParams).then(jobData => {
             activeCircles[jobData.jobId] = circle;
             state.lastDaaCircleId = jobData.jobId;
-            state.isAutoJobPending = false;
-            console.log(`Automatic job #${jobData.jobId} started with max resolution (k_max) = ${jobParams.size}.`);
-        })
-        .catch(err => {
+            console.log(`Automatic job #${jobData.jobId} started (k_max=${jobParams.size}).`);
+            state.lastAutoLaunchTs = 0; // reset throttle per il prossimo tick
+        }).catch(err => {
             elements.map.removeLayer(circle);
             alert(`Error starting automatic job: ${err.message}`);
             state.followAircraftActive = false;
             updateFollowAircraftAvailability();
         });
-    }).catch(err => {
-        alert('Could not get FGFS status.');
-        state.followAircraftActive = false;
-        updateFollowAircraftAvailability();
+    }).finally(() => {
+        // libera SEMPRE il trigger (anche in caso di errore)
+        state.isAutoJobPending = false;
+        state.lastAutoLaunchTs = Date.now();
+    }).catch(() => {
+        // (il catch dopo finally serve solo se la Promise outer lancia prima)
     });
 }
 
@@ -426,30 +427,57 @@ function processQueueSequentially() {
  * close to the center of the current job circle.
  */
 function checkAutoFollow() {
-    if (!state.isConnected || !state.followAircraftAllowed || !state.followAircraftActive || state.isAutoJobPending) {
-        return;
-    }
+    const now = Date.now();
+    const throttleOk = (now - state.lastAutoLaunchTs) >= MIN_JOB_INTERVAL_MS;
+    if (!state.followAircraftActive) return;
+    if (state.isAutoJobPending) { log('DAA skip: pending'); return; }
+    if (!throttleOk) { log('DAA skip: throttle'); return; }
 
     api.getFgfsStatus().then(data => {
         if (!data.active) return;
 
-        // Se non abbiamo un punto di partenza o un cerchio di riferimento, non possiamo fare nulla.
-        if (!state.lastDaaOriginPoint || !state.lastDaaCircleId || !activeCircles[state.lastDaaCircleId]) {
+        // Usa prima il layer salvato; se manca, prova con l'ID
+        const lastCircle =
+        state.lastDaaCircleLayer ||
+        (state.lastDaaCircleId ? activeCircles[state.lastDaaCircleId] : null);
+
+        if (!lastCircle) {
+            if (state.lastDaaCenterPoint) {
+                const acPos  = L.latLng(data.lat, data.lon);
+                const radius = (parseFloat(elements.radiusInput.value) || 20) * 1852; // metri
+                const distToCtr = acPos.distanceTo(state.lastDaaCenterPoint);
+                if (distToCtr > radius * OVERLAP_FACTOR) {
+                    log('DAA Fallback trigger (no layer, using saved centre)');
+                    state.isAutoJobPending = true;
+                    startAutomaticFollowJob();
+                }
+            }
             return;
         }
 
-        const acPos = L.latLng(data.lat, data.lon);
-        const lastCircle = activeCircles[state.lastDaaCircleId];
-        const radius = lastCircle.getRadius(); // Raggio in metri
+        const acPos   = L.latLng(data.lat, data.lon);
+        const radius  = lastCircle.getRadius();                    // metri
+        const centre  = state.lastDaaCenterPoint || lastCircle.getLatLng();
 
-        // Misura la distanza tra la posizione attuale e quella che abbiamo salvato.
-        const dist = acPos.distanceTo(state.lastDaaOriginPoint);
+        const distToCtr = acPos.distanceTo(centre);
+        const FIRE_TH   = radius * OVERLAP_FACTOR;       // es. 0.4·R
+        const ARM_TH    = radius * (OVERLAP_FACTOR * 0.7); // isteresi: es. 0.28·R
 
-        // La condizione ora funziona perché confronta la distanza percorsa con il raggio.
-        if (dist > radius * OVERLAP_FACTOR) {
-            console.log("DAA Trigger: Distanza percorsa sufficiente. Avvio nuovo job...");
+        // 1) Se NON armati, armiamoci solo quando entriamo “sotto” ARM_TH
+        if (!state.daaArmed) {
+            if (distToCtr <= ARM_TH) {
+                state.daaArmed = true;
+                log('DAA armed: dist=', Math.round(distToCtr), 'arm=', Math.round(ARM_TH));
+            }
+            return; // fino a quando non siamo armati, niente trigger
+        }
+        // 2) Se armati, spara quando torniamo SOPRA FIRE_TH (e throttle OK)
+        if (distToCtr >= FIRE_TH) {
+            log('DAA fire: dist=', Math.round(distToCtr), 'fire=', Math.round(FIRE_TH));
             state.isAutoJobPending = true;
             startAutomaticFollowJob();
+            // disarma per il ciclo successivo (verrà riaramato quando ci si riavvicina)
+            state.daaArmed = false;
         }
     });
 }
@@ -469,9 +497,11 @@ function clearAllDaaCircles() {
     }
     state.lastDaaCircleId = null;
     state.lastDaaOriginPoint = null;
+    state.lastDaaCenterPoint = null;
+    state.lastDaaCircleLayer = null;
+    state.daaArmed = false;
     console.log("DAA: Cleared all active job circles.");
 }
-
 
 
 // ------------------------------------------------------------------
@@ -696,6 +726,35 @@ elements.icaoInput.addEventListener('keydown', (e) => {
         alert(`Error: Could not resolve ICAO '${icao}'.`);
     });
     }
+});
+
+elements.btnFillHoles.addEventListener('click', () => {
+    // 1. Disattiva subito il pulsante e applica lo stile "working"
+    elements.btnFillHoles.disabled = true;
+    elements.btnFillHoles.classList.add('btn-working');
+
+    // Recupera i dati necessari (lo facciamo qui, così se l'utente annulla non succede nulla)
+    const bounds = elements.map.getBounds();
+    const settings = {
+        size: parseInt(elements.sizeInput.value, 10) || 4,
+                                       over: parseInt(elements.overSelect.value, 10) || 1,
+                                       sdwn: parseInt(elements.sdwnSelect.value, 10) || 0
+    };
+
+    // 2. Chiama l'API per avviare il processo in background
+    api.fillHoles(bounds, settings)
+    .catch(err => {
+        // Se c'è un errore nella chiamata, mostra un alert
+        alert(`Error starting the patch process: ${err.message}`);
+    })
+    .finally(() => {
+        // 3. Imposta un timer per riattivare il pulsante dopo 60 secondi
+        // Questo avviene sia in caso di successo che di fallimento della chiamata API
+        setTimeout(() => {
+            elements.btnFillHoles.disabled = false;
+            elements.btnFillHoles.classList.remove('btn-working');
+        }, 60000); // 60 secondi in millisecondi
+    });
 });
 
 

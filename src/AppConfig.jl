@@ -260,13 +260,25 @@ function _parse_commandline(args)
         "--proxy"
         help = "Proxy string ipv4:port for example: \"192.168.0.1:8080\""
         default = nothing
-        "--attemps"
-        help = "Number of download attempts"
+        "--min_chunk_bytes"
+        help = "Minimum png file size for chunks (64 byte)"
         arg_type = Int64
-        default = nothing
+        default = 64
+        "--attemps"
+        help = "Number of download attempts (def 5)"
+        arg_type = Int64
+        default = 5
         "--timeout"
-        help = "Download timeout in seconds for each chunk"
+        help = "Base download timeout in seconds for each chunk (60)"
         arg_type = Int
+        default = nothing
+        "--retry_timeout_factor"
+        help = "retry timeout factor (def 1.6)"
+        arg_type = Float64
+        default = nothing
+        "--retry_timeout_cap"
+        help = "Retry timeout cap (def 300)"
+        arg_type = Float64
         default = nothing
         "--debug", "-d"
         help = "Debug level"
@@ -280,10 +292,10 @@ function _parse_commandline(args)
         help = "Program version"
         action = :store_true
         "--http"
-        help = "Avvia un server web locale. Usato come flag usa la porta 8000, altrimenti la porta specificata (es. --webserver 8081)."
+        help = "Starts a local web server. Used as a flag, it uses port 8000; otherwise, it uses the specified port (es. --webserver 8081)."
         arg_type = Int
         nargs = '*' # Accetta zero o più valori (restituirà un array)
-        default = nothing # Se non presente, il valore è nothing
+        default = 8000 # Se non presente, il valore è nothing
     end
 
     # parse_args gestisce automaticamente gli argomenti passati

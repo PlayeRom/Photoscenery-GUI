@@ -22,7 +22,7 @@ using FilePathsBase
 
 # --- Exports ---
 # Functions made available when this module is used by other code
-export startFind, find_file_by_id, moveImage, set_data_file_path!, syncScan, printStats, place_tile!, generate_coverage_json
+export startFind, find_file_by_id, moveImage, set_data_file_path!, syncScan, printStats, place_tile!, generate_coverage_json, has_suitable_tile
 
 
 const SKIP_NOACCESS = e -> begin
@@ -836,6 +836,41 @@ function startFind()
             _is_scanning[] = false
         end
     end
+end
+
+
+"""
+has_suitable_tile(id, target_sizeId, rootPath, savePath, cfg) -> Bool
+
+Esegue un controllo "read-only" per determinare se un tassello adeguato
+esiste già in `rootPath` o `savePath`, basandosi sulla logica di `--over`.
+Non sposta alcun file.
+"""
+function has_suitable_tile(id::Int, target_sizeId::Int, rootPath::String, savePath::String, cfg::Dict)
+    overwrite_mode = get(cfg, "over", 1) # Default a 1 (sovrascrivi se migliore)
+
+    # Trova tutte le versioni esistenti del tile, ovunque si trovino
+    all_versions = find_all_versions_by_id(id)
+    if isempty(all_versions)
+        return false # Non esiste, quindi non è "suitable"
+    end
+
+    # Trova la versione con la risoluzione più alta tra quelle esistenti
+    best_existing = sort(all_versions, by = v -> get(v, "sizeId", -1), rev=true)[1]
+    best_existing_sizeId = get(best_existing, "sizeId", -1)
+
+    if overwrite_mode == 0
+        # Mai sovrascrivere: se esiste (a qualsiasi risoluzione), è "suitable".
+        return true
+        elseif overwrite_mode == 1
+        # Sovrascrivi solo se il nuovo è migliore: è "suitable" se l'esistente è >= del nuovo.
+        return best_existing_sizeId >= target_sizeId
+        elseif overwrite_mode == 2
+        # Sovrascrivi sempre: nessun file esistente è "suitable" per bloccare un nuovo download.
+        return false
+    end
+
+    return false # Default
 end
 
 

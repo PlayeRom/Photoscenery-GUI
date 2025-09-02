@@ -37,65 +37,42 @@ using ..AssemblyMonitor
 using ..ddsFindScanner, ..JobFactory
 using .Commons: chunk_pixel_size
 
-export prepare_paths_and_location, process_target_area, create_precoverage_jobs, create_chunk_jobs
+export prepare_paths_and_location, process_target_area, create_precoverage_jobs, create_chunk_jobs, process_fill_holes
 
+function generate_all_tiles(
+    area::MapCoordinates,
+    cfg::Dict,
+    rootPath::String,
+    rootPath_save::String;
+    heading_deg::Union{Nothing,Float64}=nothing,   # ← passato dal chiamante in DAA
+    alt_ft::Union{Nothing,Float64}=nothing         # ← passato dal chiamante (quota AGL)
+    )
+    # (tile, metrica_per_ordinamento, distanza_radiale) per tie-break
+    tiles_with_distance = Vector{Tuple{TileMetadata, Float64, Float64}}()
 
-function generate_all_tiles(area::MapCoordinates, cfg::Dict, rootPath::String, rootPath_save::String)
-    tiles_with_distance = Vector{Tuple{TileMetadata, Float64}}()
-    lat_step = 0.125
-    base_size_id = get(cfg, "size", 4)
-    offset_dist_deg = 0.0 # Inizializza l'offset a zero
+    lat_step      = 0.125
+    base_size_id  = get(cfg, "size", 4)
+    mode_is_daa   = get(cfg, "mode", "manual") == "daa"
+    offset        = 0.0
 
-    # 1. Calcolo dei limiti della griglia standard, basata sul raggio
-    radius_deg = area.radius * (1 / 60)
-    lat_min_grid = floor((area.lat - radius_deg) / lat_step) * lat_step
-    lat_max_grid = ceil((area.lat + radius_deg) / lat_step) * lat_step
-    lon_min_grid = floor((area.lon - radius_deg / cosd(area.lat)) / tileWidth(area.lat)) * tileWidth(area.lat)
-    lon_max_grid = ceil((area.lon + radius_deg / cosd(area.lat)) / tileWidth(area.lat)) * tileWidth(area.lat)
+    if mode_is_daa offset = 0.25 end  # ~1/4° leggera espansione bbox per sicurezza bordi (non altera il filtro circolare)
 
-    # --- 2. ESPANSIONE DINAMICA DELLA GRIGLIA ---
-    # Applichiamo un offset solo se siamo in modalità "Download Around Aircraft"
-    if get(cfg, "mode", "manual") == "daa"
-        heading_deg = 0.0
-        has_heading = false
-        try
-            # Recuperiamo la direzione dalla connessione FGFS
-            if GuiMode.FGFS_CONNECTION[] !== nothing && GuiMode.FGFS_CONNECTION[].actual !== nothing
-                heading_deg = GuiMode.FGFS_CONNECTION[].actual.directionDeg
-                has_heading = true
-            end
-        catch
-            # Ignora, non applicheremo l'offset se ci sono problemi
-        end
+    # 1) Griglia base dal raggio (in gradi)
+    # ATTENZIONE Questo algortmo per ricavare lat_min_grid lat_max_grid lon_min_grid lon_max_grid è essenziale che non venga variato in funzione
+    # del metodo atottato di arrotondamento, altrimenti avremo disallineamento nei tiles!
+    radius_deg   = area.radius * (1 / 60)
+    lat_min_grid = floor((area.lat - radius_deg - offset) / lat_step) * lat_step
+    lat_max_grid = ceil((area.lat + radius_deg + offset) / lat_step) * lat_step
+    lon_min_grid = floor(((area.lon - offset) - radius_deg / cosd(area.lat)) / tileWidth(area.lat)) * tileWidth(area.lat)
+    lon_max_grid = ceil(((area.lon + offset) + radius_deg / cosd(area.lat)) / tileWidth(area.lat)) * tileWidth(area.lat)
 
-        if has_heading
-            @info "GeoEngine: Applicazione espansione dinamica per DAA con heading: $heading_deg"
-            offset_dist_deg = 0.25 # 1/4 di grado, come richiesto
+    @info "GeoEngine: Generazione griglia tile (filtro radiale; LOD anisotropo in DAA)…"
 
-            heading_rad = deg2rad(heading_deg)
-            offset_lat_component = offset_dist_deg * cos(heading_rad)
-            offset_lon_component = offset_dist_deg * sin(heading_rad)
+    # 3) Parametri ellisse DAA: larghezza = diametro area ⇒ B = radius
+    A = get(cfg, "daa_forward_nm", area.radius * 1.5)  # semi‑asse lungo rotta
+    B = area.radius                                    # semi‑asse laterale (richiesta)
+    θ = mode_is_daa && heading_deg !== nothing ? deg2rad(heading_deg) : 0.0
 
-            # Estendiamo il riquadro di ricerca nella direzione del moto
-            if offset_lat_component > 0
-                lat_max_grid += offset_dist_deg # Aumenta il limite superiore (Nord)
-            else
-                lat_min_grid -= offset_dist_deg # Diminuisce il limite inferiore (Sud)
-            end
-
-            # La correzione con cosd(area.lat) è necessaria per la longitudine
-            if offset_lon_component > 0
-                lon_max_grid += offset_dist_deg / cosd(area.lat) # Aumenta il limite Est
-            else
-                lon_min_grid -= offset_dist_deg / cosd(area.lat) # Diminuisce il limite Ovest
-            end
-        end
-    end
-    # --- FINE LOGICA DI ESPANSIONE ---
-
-    @info "GeoEngine: Generazione griglia tile con ordinamento dal centro..."
-
-    # 3. La scansione ora utilizzerà la griglia potenzialmente espansa
     for lat in lat_min_grid:lat_step:lat_max_grid
         current_lon_step = tileWidth(lat)
         for lon in lon_min_grid:current_lon_step:lon_max_grid
@@ -103,49 +80,55 @@ function generate_all_tiles(area::MapCoordinates, cfg::Dict, rootPath::String, r
             lonC = lon + current_lon_step / 2
             tile_id = index(latC, lonC)
 
-            dist_nm = Geodesics.surface_distance(lonC, latC, area.lon, area.lat, Geodesics.localEarthRadius(latC)) / 1852.0
+            # --- INCLUSIONE: SOLO cerchio centrato (copertura invariata) ---
+            radial_nm = Geodesics.surface_distance(
+                lonC, latC, area.lon, area.lat, Geodesics.localEarthRadius(latC)
+                ) / 1852.0
+            radial_nm <= area.radius || continue
 
-            # Filtra i tile fuori dal raggio, tenendo conto dell'offset applicato
-            if dist_nm > (area.radius + offset_dist_deg * 60) # converti offset in gradi a NM per il confronto
+            # --- METRICA per priorità/LOD ---
+            metric_nm = radial_nm
+            if mode_is_daa
+                Δnorth_nm = (latC - area.lat) * 60.0
+                Δeast_nm  = (lonC - area.lon) * Commons.longDegOnLatitudeNm(latC)
+                x_forward =  Δnorth_nm * cos(θ) + Δeast_nm * sin(θ)
+                y_side    = -Δnorth_nm * sin(θ) + Δeast_nm * cos(θ)
+                # distanza “unitaria” ellittica riportata in NM (scala con radius)
+                metric_nm = sqrt((x_forward/A)^2 + (y_side/B)^2) * area.radius
+            end
+
+            # --- LOD adattivo + pavimento sdwn ---
+            alt_used_ft = alt_ft === nothing ? 1000.0 : alt_ft
+            adaptive_id  = Commons.adaptive_size_id(base_size_id, alt_used_ft, metric_nm, 90.0)
+            min_size_id  = get(cfg, "sdwn", base_size_id)
+            effective_id = max(min_size_id, adaptive_id)
+
+            params = getSizeAndCols(effective_id)
+            if params === nothing
+                @warn "ID risoluzione non valido ($effective_id) per tile $tile_id. Salto."
                 continue
             end
+            effective_width, effective_cols = params
 
-            # --- Logica di risoluzione adattiva e controllo sovrascrittura (invariata) ---
-            alt_ft = 1000.0 # Valore di default
-            try
-                if GuiMode.FGFS_CONNECTION[] !== nothing && GuiMode.FGFS_CONNECTION[].actual !== nothing
-                    alt_ft = GuiMode.FGFS_CONNECTION[].actual.altitudeFt
-                end
-            catch
-            end
-            adaptive_id = Commons.adaptive_size_id(base_size_id, alt_ft, dist_nm, 90.0)
-            min_size_id = get(cfg, "sdwn", base_size_id)
-            effective_size_id = max(min_size_id, adaptive_id)
-
-            effective_params = getSizeAndCols(effective_size_id)
-            if effective_params === nothing
-                @warn "ID risoluzione non valido ($effective_size_id) per tile $tile_id. Salto."
-                continue
-            end
-            effective_width, effective_cols = effective_params
-            if ddsFindScanner.moveImage(rootPath, rootPath_save, tile_id, effective_size_id, cfg) in ("moved", "skip")
-                @info "GeoEngine.generate_all_tiles: Tile $tile_id recuperato dalla cache o già presente."
+            # Cache (salta se già presente / spostato)
+            if ddsFindScanner.has_suitable_tile(tile_id, effective_id, rootPath, rootPath_save, cfg)
+                @info "GeoEngine.generate_all_tiles: Tile $tile_id già presente con risoluzione adeguata. Salto."
                 continue
             end
 
             tile = TileMetadata(
-                tile_id, effective_size_id,
+                tile_id, effective_id,
                 lon, lat, lon + current_lon_step, lat + lat_step,
                 Commons.x_index(latC, lonC), Commons.y_index(latC),
                 lonC, latC, current_lon_step,
-                effective_width,
-                effective_cols
-            )
-            push!(tiles_with_distance, (tile, dist_nm))
+                effective_width, effective_cols
+                )
+            push!(tiles_with_distance, (tile, metric_nm, radial_nm))
         end
     end
 
-    sort!(tiles_with_distance, by = item -> item[2])
+    # Ordinamento con tie‑break: prima metrica ellittica (o radiale), poi distanza radiale
+    sort!(tiles_with_distance, by = item -> (item[2], item[3]))
     sorted_tiles = [item[1] for item in tiles_with_distance]
     return unique(t -> t.id, sorted_tiles)
 end
@@ -311,14 +294,19 @@ function process_target_area(
     cfg::Dict,
     map_server::MapServer,
     root_path::String,
-    save_path::String
+    save_path::String,
+    heading_deg::Union{Nothing,Float64}=nothing,
+    alt_ft::Union{Nothing,Float64}=nothing
     )
     tmp_dir = joinpath(save_path, "tmp")
     mkpath(tmp_dir)
 
     # --- 1. PREPARAZIONE ---
     # Genera la lista di tile ad alta risoluzione necessari.
-    tiles = generate_all_tiles(area, cfg, root_path, save_path)
+    tiles = generate_all_tiles(
+        area, cfg, root_path, save_path;
+        heading_deg=heading_deg, alt_ft=alt_ft
+    )
     if isempty(tiles)
         @info "GeoEngine: Nessun tile da processare per l'area specificata."
         return nothing
@@ -333,24 +321,44 @@ function process_target_area(
     nworkers = get(cfg, "workers", 8)
     Downloader.start_chunk_downloads_parallel!(nworkers, map_server, cfg, root_path, save_path, tmp_dir)
 
-    # --- 2. LOGICA DI PRE-COPERTURA (preview 0→2) ---
-    # Mettiamo SEMPRE in coda, in quest’ordine, i livelli più grossolani (0..2)
-    # prima di generare i job ad alta risoluzione. Questo garantisce una preview rapida.
-    preview_levels = 0:min(2, get(cfg, "size", 4))  # limita a 0..2 e non supera la size target
-    for lvl in preview_levels
-        @info "GeoEngine: Fase 1 - Pre-coverage livello $lvl..."
-        precoverage_jobs = create_precoverage_jobs(tiles, lvl, tmp_dir)
-        if !isempty(precoverage_jobs)
-            @info "GeoEngine: Accodamento di $(length(precoverage_jobs)) job di pre-copertura (lvl=$lvl)."
-            Downloader.enqueue_chunk_jobs!(Downloader.CHUNK_QUEUE, precoverage_jobs)
-        end
+    # --- 2. LOGICA DI PRE-COPERTURA (dinamica) ---
+    # Scegli un SOLO livello di preview in [0..2] in funzione del fabbisogno reale dell'area.
+    # 1) peak_id = livello massimo richiesto tra i tile (più fine)
+    # 2) dyn_preview = peak_id - 2 (clamp a [0,2]) per ridurre il "gap"
+    # 3) sdwn_floor = rispetto il minimo scelto dall'utente (clamp a [0,2])
+    # 4) precover_id = max(dyn_preview, sdwn_floor)
+
+    # 1) ricavo il livello minimo effettivo richiesto dai tile generati
+    min_required_unclamped = minimum(t -> t.size_id, tiles)
+
+    # 2) gap configurabile (default 1), clamp a [0,2] e senza superare la size target
+    precover_gap   = get(cfg, "precover_gap", 1)
+    precover_level = clamp(min_required_unclamped - precover_gap, 0, 2)
+    precover_level = min(precover_level, get(cfg, "size", 4))  # di fatto è già ≤2, ma resta coerente con size
+
+    @info "GeoEngine: Fase 1 - Pre-coverage livello $(precover_level) (min_area=$(min_required_unclamped), gap=$(precover_gap))"
+    precoverage_jobs = create_precoverage_jobs(tiles, precover_level, tmp_dir)
+    if !isempty(precoverage_jobs)
+        @info "GeoEngine: Accodamento di $(length(precoverage_jobs)) job di pre-copertura (lvl=$(precover_level))."
+        Downloader.enqueue_high!(precoverage_jobs)
     end
 
     # --- 3. LOGICA DI DOWNLOAD PRINCIPALE ---
     @info "GeoEngine: Fase 2 - Generazione job ad alta risoluzione..."
     high_res_jobs = create_chunk_jobs(tiles, cfg, tmp_dir)
     @info "GeoEngine: Accodamento di $(length(high_res_jobs)) chunk-job ad alta risoluzione."
-    Downloader.enqueue_chunk_jobs!(Downloader.CHUNK_QUEUE, high_res_jobs)
+    ##Downloader.enqueue_chunk_jobs!(Downloader.CHUNK_QUEUE, high_res_jobs)
+    if get(cfg, "mode", "manual") == "daa"
+        frac = get(cfg, "daa_priority_frac", 0.35)
+        cut  = clamp(ceil(Int, length(high_res_jobs) * frac), 1, length(high_res_jobs))
+        jobs_hi = high_res_jobs[1:cut]
+        jobs_lo = cut < length(high_res_jobs) ? high_res_jobs[(cut+1):end] : Commons.ChunkJob[]
+        Downloader.enqueue_high!(jobs_hi)
+        Downloader.enqueue_low!(jobs_lo)
+        @info "GeoEngine: enqueue HI=$(length(jobs_hi)) / LO=$(length(jobs_lo)) (frac=$(frac))"
+    else
+        Downloader.enqueue_low!(high_res_jobs)
+    end
 
 
     # --- 4. ATTESA COMPLETAMENTO ---
@@ -387,6 +395,108 @@ function process_target_area(
     wait(monitor_task)
 
     @info "GeoEngine: process_target_area terminato."
+end
+
+
+"""
+count_existing_neighbors(latC::Float64, lonC::Float64) -> Int
+
+Data la coordinata centrale di un potenziale tassello, calcola gli ID dei suoi
+4 vicini cardinali (N, E, S, O) e restituisce il numero di quelli che esistono già.
+"""
+function count_existing_neighbors(latC::Float64, lonC::Float64)::Int
+    neighbor_count = 0
+    lat_step = 0.125
+    lon_step = Commons.tileWidth(latC)
+
+    # Definiamo SOLO le 4 direzioni cardinali (Nord, Sud, Est, Ovest)
+    neighbor_offsets = [
+        (lat_step, 0.0),      # N (Nord)
+        (-lat_step, 0.0),     # S (Sud)
+        (0.0, lon_step),      # E (Est)
+        (0.0, -lon_step)      # O (Ovest)
+        ]
+
+    for (d_lat, d_lon) in neighbor_offsets
+        # Calcola il centro e l'ID del vicino
+        neighbor_latC = latC + d_lat
+        neighbor_lonC = lonC + d_lon
+        neighbor_id = Commons.index(neighbor_latC, neighbor_lonC)
+
+        # Controlla se il vicino esiste
+        if !isempty(ddsFindScanner.find_file_by_id(neighbor_id))
+            neighbor_count += 1
+        end
+    end
+
+    return neighbor_count
+end
+
+
+"""
+process_fill_holes(bounds, cfg, map_server, root_path, save_path, tmp_dir)
+
+Analizza un'area definita da `bounds`, identifica i tasselli mancanti che
+hanno almeno 3 vicini cardinali e accoda i job per il loro download.
+"""
+function process_fill_holes(bounds, cfg::Dict, map_server::Downloader.MapServer, root_path::String, save_path::String, tmp_dir::String)
+    @info "GeoEngine: Inizio analisi 'fill holes' per l'area" bounds
+
+    # ... (tutta la logica di scansione della griglia e identificazione dei buchi rimane identica) ...
+    lat_min = floor(bounds.south / 0.125) * 0.125
+    lat_max = ceil(bounds.north / 0.125) * 0.125
+    lon_min = bounds.west
+    lon_max = bounds.east
+
+    missing_tiles = Vector{Commons.TileMetadata}()
+    base_size_id = get(cfg, "size", 4)
+
+    @info "Scansione griglia da lat ($lat_min, $lat_max) e lon ($lon_min, $lon_max)"
+    for lat in lat_min:0.125:lat_max
+        lon_step = Commons.tileWidth(lat)
+        for lon in floor(lon_min / lon_step) * lon_step : lon_step : ceil(lon_max / lon_step) * lon_step
+            latC = lat + 0.125 / 2
+            lonC = lon + lon_step / 2
+            tile_id = Commons.index(latC, lonC)
+
+            if isempty(ddsFindScanner.find_file_by_id(tile_id))
+                neighbor_count = count_existing_neighbors(latC, lonC)
+                if neighbor_count >= 3
+                    @info "Trovato buco interno da riempire: ID $tile_id (vicini: $neighbor_count)"
+                    width, cols = Commons.getSizeAndCols(base_size_id)
+                    x_idx, y_idx = Commons.x_index(latC, lonC), Commons.y_index(latC)
+
+                    tile = Commons.TileMetadata(
+                        tile_id, base_size_id,
+                        lon, lat, lon + lon_step, lat + 0.125,
+                        x_idx, y_idx,
+                        lonC, latC, lon_step,
+                        width, cols
+                        )
+                    push!(missing_tiles, tile)
+                end
+            end
+        end
+    end
+    # ... (fine della logica di scansione) ...
+
+    if isempty(missing_tiles)
+        @info "GeoEngine: Nessun buco interno trovato nell'area visibile."
+        return
+    end
+
+    @info "GeoEngine: Trovati $(length(missing_tiles)) buchi da riempire. Generazione dei job..."
+
+    # 1. Avvia i servizi in background (worker e fallback manager) che ascolteranno le code.
+    #    Questo è il passaggio che mancava.
+    nworkers = get(cfg, "workers", 8)
+    Downloader.start_chunk_downloads_parallel!(nworkers, map_server, cfg, root_path, save_path, tmp_dir)
+
+    # 2. Crea e accoda i job (questa parte era già presente e corretta)
+    high_res_jobs = create_chunk_jobs(missing_tiles, cfg, tmp_dir)
+    Downloader.enqueue_low!(high_res_jobs)
+
+    @info "GeoEngine: $(length(high_res_jobs)) chunk job accodati per riempire i buchi."
 end
 
 

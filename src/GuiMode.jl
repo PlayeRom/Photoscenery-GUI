@@ -136,6 +136,8 @@ function handle(req::HTTP.Request)
                 return h_disconnect(req)
             elseif p == "/api/start-job"
                 return h_start_job(req)
+            elseif p == "/api/fill-holes"
+                return h_fill_holes(req)
             elseif p == "/api/shutdown"
                 return h_shutdown(req)
         else
@@ -230,6 +232,26 @@ function h_completed_jobs(_req)
         push!(completed_ids, take!(COMPLETED_JOBS))
     end
     HTTP.Response(200, JSON3.write(completed_ids))
+end
+
+
+function h_fill_holes(req)
+    params = JSON3.read(req.body)
+    job_id = next_job_id() # Assegniamo un ID anche a questo tipo di job
+
+    # Accodiamo un nuovo tipo di "meta-job" che verrà gestito da launch_job_from_api
+    job_params = Dict(
+        "job_id"   => job_id,
+        "mode"     => "fill_holes", # Un nuovo modo per identificarlo
+        "bounds"   => params.bounds,
+        "settings" => params.settings
+        )
+
+    put!(JOB_QUEUE, job_params)
+
+    # Rispondi subito al client per non tenerlo in attesa
+    response_payload = Dict("status" => "Fill holes job queued", "jobId" => job_id)
+    return HTTP.Response(200, ["Content-Type" => "application/json"], JSON3.write(response_payload))
 end
 
 
@@ -792,74 +814,83 @@ end
 #
 # Note: This function is called by the background worker and should
 #       not be called directly from HTTP request handlers.
+
+
 function launch_job_from_api(params::Dict)
-    # Extract job ID for logging and tracking purposes
-    # This ID is used throughout the processing for identification
     job_id = params["job_id"]
+    @info "Starting job #$job_id in parallel task" job=params
 
     try
-        # Convert all keys to strings for consistent dictionary access
-        # This ensures reliable parameter access regardless of input format
+        # Normalizza le chiavi a stringa per un accesso sicuro
         p = Dict(string(k) => v for (k, v) in pairs(params))
-
-        # Explicit handling of sdwn parameter (-1 means disabled)
-        # This parameter has complex logic due to JSON null handling
-        sdwn_value = get(p, "sdwn", -1)  # Default to -1 if not present
-
-        # Check both default case (-1) and 'nothing' case (null in JSON)
-        if sdwn_value == -1 || sdwn_value === nothing
-            # Default value when parameter is disabled or absent
-            sdwn_value = 0
-        else
-            # Convert to Int only if we have a valid numeric value
-            sdwn_value = Int(sdwn_value)
-        end
-
-        # Build configuration dictionary for the job processing
-        # This contains all parameters needed by the tile processing modules
-        cfg = Dict{String, Any}(
-            "radius" => get(p, "radius", 10.0),    # Search radius for tile coverage
-            "size"   => get(p, "size", 4),         # Tile size parameter
-            "over"   => get(p, "over", 1),         # Tile overlap parameter
-            "lat"    => p["lat"],                  # Latitude coordinate (required)
-            "lon"    => p["lon"],                  # Longitude coordinate (required)
-            "server" => get(p, "server", 1),       # Map server selection
-            "sdwn"   => sdwn_value,                 # Special download parameter
-            "mode"   => get(p, "mode", "manual")
-            )
-
-        # Get current module path for relative path calculations
-        # This ensures file operations work correctly regardless of working directory
+        job_mode = get(p, "mode", "manual")
         home_path = @__DIR__
 
-        # Prepare paths and location data using GeoEngine module
-        # This function handles geographic calculations and file system preparation
-        route_vec, _, root_path, save_path = GeoEngine.prepare_paths_and_location(cfg, home_path)
+        # --- INIZIO BLOCCO DI SMISTAMENTO ---
 
-        # Initialize map server for downloading operations
-        # This creates the connection to the tile download service
-        map_srv = Downloader.MapServer(get(cfg, "server", 1))
+        if job_mode == "manual" || job_mode == "daa"
+            # --- PERCORSO LOGICO 1: JOB STANDARD (DAA O MANUALE) ---
 
-        # Process each coordinate in the route vector
-        # Each coordinate represents a separate geographic area to process
-        for (lat, lon) in route_vec
-            # Create geographic area definition for tile processing
-            # This defines the boundaries for tile download and conversion
-            area = Commons.MapCoordinates(lat, lon, Float64(cfg["radius"]))
+            # 1. Costruisci la configurazione 'cfg' che richiede lat/lon
+            sdwn_value = get(p, "sdwn", -1)
+            if sdwn_value == -1 || sdwn_value === nothing; sdwn_value = 0; else sdwn_value = Int(sdwn_value); end
 
-            # Execute the actual tile processing for this geographic area
-            # This function handles the complete download and conversion workflow
-            GeoEngine.process_target_area(area, cfg, map_srv, root_path, save_path)
+            cfg = Dict{String, Any}(
+                "radius" => get(p, "radius", 10.0),
+                "size"   => get(p, "size", 4),
+                "over"   => get(p, "over", 1),
+                "lat"    => p["lat"], # Qui è sicuro, perché questo job DEVE avere lat/lon
+                "lon"    => p["lon"],
+                "server" => get(p, "server", 1),
+                "sdwn"   => sdwn_value,
+                "mode"   => job_mode,
+                )
+
+            # 2. Prepara percorsi e server mappe
+            route_vec, _, root_path, save_path = GeoEngine.prepare_paths_and_location(cfg, home_path)
+            map_srv = Downloader.MapServer(get(cfg, "server", 1))
+
+            # 3. Esegui il processo per ogni punto della rotta
+            for (lat, lon) in route_vec
+                area = Commons.MapCoordinates(lat, lon, Float64(cfg["radius"]))
+                heading_deg = nothing
+                alt_ft      = nothing
+                if job_mode == "daa"
+                    try
+                        if FGFS_CONNECTION[] !== nothing && FGFS_CONNECTION[].actual !== nothing
+                            heading_deg = FGFS_CONNECTION[].actual.directionDeg
+                            alt_ft      = FGFS_CONNECTION[].actual.altitudeFt
+                        end
+                    catch
+                        heading_deg, alt_ft = nothing, nothing
+                    end
+                end
+                GeoEngine.process_target_area(area, cfg, map_srv, root_path, save_path, heading_deg, alt_ft)
+            end
+
+        elseif job_mode == "fill_holes"
+            # 1. Estrai i dati specifici per questo job
+            bounds = p["bounds"]
+            settings = p["settings"]
+            fill_cfg = Dict(string(k)=>v for (k,v) in pairs(settings))
+
+            # 2. Abbiamo bisogno dei percorsi, ma non abbiamo un lat/lon.
+            #    Chiamiamo prepare_paths_and_location con una config vuota
+            #    per fargli usare la sua logica di ricerca automatica della cartella "Orthophotos".
+            _, _, root_path, save_path = GeoEngine.prepare_paths_and_location(Dict{String, Any}(), home_path)
+            tmp_dir = joinpath(save_path, "tmp")
+            mkpath(tmp_dir)
+            map_srv = Downloader.MapServer(get(fill_cfg, "server", 1))
+
+            # 3. Chiama la funzione specializzata per il riempimento
+            @async GeoEngine.process_fill_holes(bounds, fill_cfg, map_srv, root_path, save_path, tmp_dir)
         end
     catch e
-        # Log any errors that occur during job processing
-        # This provides detailed debugging information for failed jobs
         @error "GuiMode.launch_job_from_api: ❌ Job failed" exception=(e, catch_backtrace())
     finally
-        # Always log job completion, regardless of success or failure
-        # This ensures the job tracking system knows the job is done
         @info "GuiMode.launch_job_from_api: Job #$job_id **always** completed"
     end
 end
+
 
 end # module

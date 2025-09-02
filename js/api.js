@@ -127,3 +127,30 @@ export function getFgfsConnectionState() {
     .then(r => r.json())
     .then(obj => obj.state);
 }
+
+/**
+ * Asks the backend to find and download missing tiles within the given map bounds.
+ * @param {Object} bounds - Leaflet map bounds { _southWest, _northEast }.
+ * @param {Object} settings - Current job settings (size, sdwn, over).
+ * @returns {Promise}
+ */
+export function fillHoles(bounds, settings) {
+    const payload = {
+        bounds: {
+            south: bounds._southWest.lat,
+            west:  bounds._southWest.lng,
+            north: bounds._northEast.lat,
+            east:  bounds._northEast.lng
+        },
+        settings: settings
+    };
+    console.log("API: Sending fill holes request:", payload);
+    return fetch('/api/fill-holes', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(payload)
+    }).then(res => {
+        if (!res.ok) throw new Error(`Server error: ${res.statusText}`);
+        return res.json();
+    });
+}
